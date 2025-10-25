@@ -1,0 +1,206 @@
+{
+  "Functional Relevance": {
+    "definition": "This trait evaluates if an image provides information directly relevant to answering a question, either by being essential for the answer or by significantly aiding comprehension. The image's purpose should be to assist in answering the question, not merely to serve as a decorative element.",
+    "note": "Is the image necessary to answer the question, or does it mainly serve a decorative purpose?",
+    "evaluation_questions": [
+      "Is the image essential for the student to be able to answer the question?",
+      "Does the image provide information that significantly aids in understanding the question's context or content?",
+      "If the image were removed, would the question become unanswerable or significantly more difficult to comprehend?"
+    ],
+    "examples": [
+      {
+        "input": {
+          "trait": "Functional Relevance",
+          "question": "Based on the diagram, which of these is a mammal?",
+          "image": "[A cladogram showing the evolutionary relationship between a shark, a lizard, and a whale]"
+        },
+        "output": {
+          "trait": "Functional Relevance",
+          "validity": true
+        }
+      },
+      {
+        "input": {
+          "trait": "Functional Relevance",
+          "question": "What is the chemical formula for water?",
+          "image": "[A photograph of a glass of water]"
+        },
+        "output": {
+          "trait": "Functional Relevance",
+          "validity": false,
+          "reasoning": "The image is decorative. The question can be answered without it, as it tests recall of chemical knowledge, not visual interpretation."
+        }
+      }
+    ]
+  },
+  "Visual Clarity": {
+    "definition": "This trait evaluates the directness of the image in representing only what is needed to answer the question, without unnecessary clutter, decorations, or competing elements that could distract from the main content. Important items should be clearly identifiable to reduce the mental effort needed for visual search.",
+    "note": "Is the image focused and free from visual distractions?",
+    "evaluation_questions": [
+      "Does the image contain any visual elements that are unnecessary or distracting (e.g., decorative borders, complex backgrounds, irrelevant objects)?",
+      "Can you easily focus on the important parts of the image without confusion?",
+      "Does every visible element in the image serve a clear purpose in helping to answer the question?"
+    ],
+    "examples": [
+      {
+        "input": {
+          "trait": "Visual Clarity",
+          "question": "Identify the hypotenuse in the figure shown.",
+          "image": "[A simple, clean diagram of a right-angled triangle with sides labeled A, B, and C]"
+        },
+        "output": {
+          "trait": "Visual Clarity",
+          "validity": true
+        }
+      },
+      {
+        "input": {
+          "trait": "Visual Clarity",
+          "question": "Identify the hypotenuse in the figure shown.",
+          "image": "[A diagram of a right-angled triangle placed on a distracting background with patterns and watermarks]"
+        },
+        "output": {
+          "trait": "Visual Clarity",
+          "validity": false,
+          "reasoning": "The unnecessary background patterns create visual clutter that increases cognitive load and distracts from the relevant geometric figure."
+        }
+      }
+    ]
+  },
+  "Technical Quality": {
+    "definition": "This trait measures whether an image has sufficient resolution, contrast, and legibility for all important elements (including any text, labels, or fine details) to be easily perceived. Poor technical quality can create construct-irrelevant difficulty.",
+    "note": "Is the image sharp, clear, and easy to see? Can you read all text and see details without straining?",
+    "evaluation_questions": [
+      "Is the image resolution high enough so that it appears sharp and not pixelated or blurry?",
+      "Is there sufficient contrast between important elements and their background (e.g., text vs. background, lines vs. background)?",
+      "Are all text, labels, and fine details clearly legible and easy to perceive?"
+    ],
+    "examples": [
+      {
+        "input": {
+          "trait": "Technical Quality",
+          "question": "According to the chart, which category had the highest value in 2022?",
+          "image": "[A high-resolution bar chart with crisp black text on a white background]"
+        },
+        "output": {
+          "trait": "Technical Quality",
+          "validity": true
+        }
+      },
+      {
+        "input": {
+          "trait": "Technical Quality",
+          "question": "What is the label on the highlighted artery?",
+          "image": "[A blurry, low-resolution screenshot of an anatomical diagram where text labels are pixelated and hard to read]"
+        },
+        "output": {
+          "trait": "Technical Quality",
+          "validity": false,
+          "reasoning": "The image has poor resolution, making the labels illegible. This forces students to expend cognitive resources on deciphering the image rather than on the subject matter."
+        }
+      }
+    ]
+  },
+  "Standard Presentation": {
+    "definition": "This trait considers whether images and their elements appear in expected orientations and follow conventional representations familiar to the test population. Non-standard orientations can add construct-irrelevant cognitive load by requiring mental rotation.",
+    "note": "Are things shown the right way up and in a way that's conventional for the subject?",
+    "evaluation_questions": [
+      "Are the objects depicted in the image shown in their normal, upright orientation?",
+      "Does the image follow established conventions for the subject matter (e.g., maps with North at the top, graphs with axes in standard positions)?",
+      "Does the user need to mentally rotate any part of the image to understand it?"
+    ],
+    "examples": [
+      {
+        "input": {
+          "trait": "Standard Presentation",
+          "question": "What is the capital of the country labeled 'A'?",
+          "image": "[A standard political map of South America with a conventional north-up orientation]"
+        },
+        "output": {
+          "trait": "Standard Presentation",
+          "validity": true
+        }
+      },
+      {
+        "input": {
+          "trait": "Standard Presentation",
+          "question": "What is the capital of the country labeled 'A'?",
+          "image": "[A political map of South America that has been rotated 180 degrees (upside down)]"
+        },
+        "output": {
+          "trait": "Standard Presentation",
+          "validity": false,
+          "reasoning": "The map is presented in a non-standard orientation, which forces the student to perform mental rotation, adding unnecessary cognitive load unrelated to their geographical knowledge."
+        }
+      }
+    ]
+  },
+  "Text-Image Coherence": {
+    "definition": "This trait assesses whether the image and text components of a question convey consistent information without contradictions or unnecessary spatial separation. Misalignment can alter the interpretation of the question or create a split-attention effect.",
+    "note": "Do the text and the image tell the same story without contradicting each other?",
+    "evaluation_questions": [
+      "Does any information presented in the image contradict information given in the question text or options?",
+      "Are the elements, labels, or terms used in the text correctly and consistently represented in the image?",
+      "Are the text and image components placed together logically to avoid forcing the student to split their attention?"
+    ],
+    "examples": [
+      {
+        "input": {
+          "trait": "Text-Image Coherence",
+          "question": "In the circuit diagram below, what is the value of the resistor labeled R1?",
+          "image": "[A circuit diagram with a resistor clearly labeled 'R1' and its value shown as 100Ω]"
+        },
+        "output": {
+          "trait": "Text-Image Coherence",
+          "validity": true
+        }
+      },
+      {
+        "input": {
+          "trait": "Text-Image Coherence",
+          "question": "Click on the blue square.",
+          "image": "[An image containing only a red circle and a green triangle]"
+        },
+        "output": {
+          "trait": "Text-Image Coherence",
+          "validity": false,
+          "reasoning": "The text asks the student to identify a 'blue square,' but the image does not contain one, creating a direct contradiction that makes the question invalid."
+        }
+      }
+    ]
+  },
+  "Fair Representation": {
+    "definition": "This trait involves ensuring that the image avoids cultural assumptions, stereotypes, or content that could systematically advantage or disadvantage certain student groups. Unfair representations can create construct-irrelevant variance or trigger stereotype threat.",
+    "note": "Is the image culturally neutral and free from stereotypes that could bias the response?",
+    "evaluation_questions": [
+      "Does the image contain stereotypes related to gender, ethnicity, age, or other group characteristics?",
+      "Does the image rely on culturally specific knowledge that is not part of the subject being tested?",
+      "Could the content of the image be offensive or create an unfair disadvantage for any group of students?"
+    ],
+    "examples": [
+      {
+        "input": {
+          "trait": "Fair Representation",
+          "question": "If a pizza is cut into 8 equal slices and you eat 3, what fraction of the pizza is left?",
+          "image": "[A simple diagram of a circle divided into 8 segments, with 3 shaded]"
+        },
+        "output": {
+          "trait": "Fair Representation",
+          "validity": true
+        }
+      },
+      {
+        "input": {
+            "trait": "Fair Representation",
+            "question": "What fraction of the pizza is left after 3 of 8 slices are eaten?",
+            "image": "[A cartoon showing only boys eating pizza, with the girl excluded from the table]"
+        },
+        "output": {
+            "trait": "Fair Representation",
+            "validity": false,
+            "reasoning": "The image introduces gender bias by only depicting boys as participants. This is unrelated to the math skill being tested and could disadvantage or alienate some students."
+        }
+        }
+    ]
+  }
+}

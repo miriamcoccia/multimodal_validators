@@ -1,0 +1,141 @@
+{
+    "Text-Image Coherence": {
+        "definition": "The image visually depicts the main concept, object, or scenario that the question is asking about. It shows what needs to be seen to understand the question topic.",
+        "note": "Does the image show the thing the question is asking about? Ignore whether text or results are visible in the image.",
+        "evaluation_questions": [
+            "What is the main subject/concept the question is asking about?",
+            "Does this image show that subject/concept visually?",
+            "Would seeing this image help someone understand what the question refers to?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Text-Image Coherence",
+                    "question": "What type of animal is shown in the picture?",
+                    "image": "[A photo of a golden retriever]"
+                },
+                "output": {
+                    "trait": "Text-Image Coherence",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Text-Image Coherence",
+                    "question": "What is the capital of France?",
+                    "image": "[A photo of a golden retriever]"
+                },
+                "output": {
+                    "trait": "Text-Image Coherence",
+                    "validity": false,
+                    "reasoning": "The image shows a dog, but the question asks about France's capital."
+                }
+            }
+        ]
+    },
+
+    
+    "Standard Presentation": {
+        "definition": "Text and objects appear in normal, expected orientation. Text is horizontal and readable left-to-right. Objects appear right-side up as people normally see them.",
+        "note": "Is everything oriented the way people expect to see it?",
+        "evaluation_questions": [
+            "Is any text in the image horizontal and easy to read?",
+            "Are objects shown in their normal, upright position?",
+            "Do you need to rotate your head to understand anything?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Standard Presentation",
+                    "question": "What type of vehicle is shown?",
+                    "image": "[A car shown upright with any labels in horizontal text]"
+                },
+                "output": {
+                    "trait": "Standard Presentation",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Standard Orientation",
+                    "question": "What type of vehicle is shown?",
+                    "image": "[A car shown upside down with diagonal text]"
+                },
+                "output": {
+                    "trait": "Standard Orientation",
+                    "validity": false,
+                    "reasoning": "The car is upside down and text is diagonal, making recognition harder."
+                }
+            }
+        ]
+    },
+    "Contrast Clarity": {
+        "definition": "Important visual elements stand out clearly from their background through strong light/dark differences, making everything easy to see and distinguish.",
+        "note": "Can you easily see and distinguish all important parts of this image?",
+        "evaluation_questions": [
+            "Are there clear differences between light and dark areas?",
+            "Can you easily distinguish different elements from backgrounds?",
+            "Is any text easy to read against its background?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Contrast Clarity",
+                    "question": "What does the diagram show?",
+                    "image": "[Black text on a white background with clear element separation]"
+                },
+                "output": {
+                    "trait": "Contrast Clarity",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Contrast Clarity",
+                    "question": "What is the label for the red bar?",
+                    "image": "[Light gray text on a white background that's hard to read]"
+                },
+                "output": {
+                    "trait": "Contrast Clarity",
+                    "validity": false,
+                    "reasoning": "Low contrast between text and background makes it difficult to read."
+                }
+            }
+        ]
+    },
+    
+    "Visual Clarity": {
+        "definition": "The image focuses on essential elements without unnecessary visual clutter, decorations, or distracting elements that don't serve a purpose.",
+        "note": "Is this image focused and free from visual distractions?",
+        "evaluation_questions": [
+            "Are there any visual elements that seem unnecessary or distracting?",
+            "Can you focus easily on important parts without confusion?",
+            "Does every visible element serve a clear purpose?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Visual Clarity",
+                    "question": "How many triangles are in the figure?",
+                    "image": "[A clean geometric figure with only the relevant triangular shapes]"
+                },
+                "output": {
+                    "trait": "Visual Clarity",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Visual Clarity",
+                    "question": "How many triangles are in the figure?",
+                    "image": "[Triangular shapes mixed with decorative patterns, gradients, and unrelated icons]"
+                },
+                "output": {
+                    "trait": "Visual Clarity",
+                    "validity": false,
+                    "reasoning": "Unnecessary decorative elements distract from counting the triangles."
+                }
+            }
+        ]
+    }
+}

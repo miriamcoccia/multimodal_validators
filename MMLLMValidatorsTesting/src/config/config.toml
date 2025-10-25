@@ -1,0 +1,96 @@
+# =============================================================================
+#  AGENTIC FRAMEWORK CONFIGURATION
+# =============================================================================
+
+# =============================================================================
+#  PATHS
+# =============================================================================
+[paths]
+# Base directory for the ScienceQA image dataset
+image_base_dir = "data/ScienceQA_images/test"
+# Path to the main input data CSV
+input_data_csv = "data/ScienceQA_test_mc_images.csv"
+# Directory to save output results
+results_dir = "data/gpt-4o-mini-no-examples/"
+# Path to the JSON file containing trait definitions and examples
+trait_definitions_json = "data/prompt_fillers.json"
+# Path to the JSON file containing original trait definitions and examples
+orig_trait_definitions_json = "data/orig_prompt_fillers.json"
+# Path to JSON file to save output checkpoints
+checkpoint_json = "data/checkpoint.json"
+# Path to the jsonl file to store the batch requests
+batch_request_file = "data/batch_request_file.jsonl"
+
+
+# =============================================================================
+#  SETTINGS
+# =============================================================================
+[settings]
+# Default timeout for API requests in seconds
+default_timeout = 600
+# Placeholders in the dataset that indicate an absence of an image
+image_folder_placeholders = ["", "none", "image.png"]
+# Multiple-choice option labels
+choice_options = ["A", "B", "C", "D", "E"]
+
+
+# =============================================================================
+#  DEFAULTS
+# =============================================================================
+[defaults]
+# Default models to use as fallbacks in the MultimodalLLM_Service
+openai_multimodal_default = "GPT4oMini"
+nebius_multimodal_default = "L_Gemma327B"
+
+
+# =============================================================================
+#  API & SERVICES
+# =============================================================================
+
+[api_keys]
+# These will be populated from environment variables
+openai_api_key_env="OPENAI_API_KEY"
+nebius_api_key_env="NEBIUS_API_KEY"
+
+[services]
+# Base URLs for different model-serving APIs
+[services.openai]
+base_url = "https://api.openai.com/v1/chat/completions"
+batch_url = "/v1/responses"
+
+[services.nebius]
+base_url = "https://api.studio.nebius.com/v1/"
+batch_url = "/v1/chat/completions" # TEST
+
+# =============================================================================
+#  MODEL DEFINITIONS
+# =============================================================================
+# Each subsection defines a group of models. 
+# The key is the name used in the code (e.g., "GPT4oMini").
+# The value is the actual model identifier for the API (e.g., "gpt-4o-mini").
+
+[models.nebius]
+L_Gemma327B="google/gemma-3-27b-it"
+L_Qwen25VL72B="Qwen/Qwen2.5-VL-72B-Instruct"
+
+[models.openai]
+GPT4o = "gpt-4o"
+GPT4oMini = "gpt-4o-mini"
+
+
+# =============================================================================
+#  ENSEMBLE COMBINATIONS
+# =============================================================================
+
+[ensemble_models]
+#gemma_ensemble = ["L_Gemma34B","L_Gemma312B","L_Gemma327B"]
+#mistral_ensamble = ["L_MistralSmall3124B","L_MistralSmall3224B"]
+ensemble_combinations = [["L_MistralSmall3124B","L_MistralSmall3224B"]]
+
+
+# =============================================================================
+#  MODEL PARAMETERS
+# =============================================================================
+[parameters.openai]
+max_tokens = 256
+image_detail = "auto" # Can be "low", "high", or "auto"

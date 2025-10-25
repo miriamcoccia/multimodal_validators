@@ -1,0 +1,14 @@
+/mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/src/MMLLMValidatorsTesting/LLMValidatorsTesting.py:128: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  self.traits_evaluation_results = pd.concat(
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/src/MMLLMValidatorsTesting/Main.py", line 173, in <module>
+    LLMrunner.run_per_qid(prompt_ids=prompt_IDs, model_ids=models)
+  File "/mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/src/MMLLMValidatorsTesting/LLMValidatorsTesting.py", line 261, in run_per_qid
+    self.statistics.generate_summary()
+  File "/mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/src/MMLLMValidatorsTesting/Statistics.py", line 212, in generate_summary
+    if t.get("trait") == trait and t.get("valid"):
+AttributeError: 'str' object has no attribute 'get'

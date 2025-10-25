@@ -1,0 +1,450 @@
+{
+    "Scope": {
+        "definition": "The activity is suitable to assess a target learning outcome at a given level.",
+        "note": "Does this question test the intended skill (e.g., 'Analyze historical structures') for the specified grade level (e.g., 'Grade 6')?",
+        "evaluation_questions": [
+            "What specific skill and grade level is this question for?",
+            "Does answering the question correctly require a student at that grade level to use that specific skill?",
+            "Is the content appropriate for the subject and topic listed?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Scope",
+                    "activity_description": "Context: A Grade 6 social studies question asks students to determine the function of a Roman aqueduct from a short passage, testing the skill 'Analyze historical structures'."
+                },
+                "output": {
+                    "trait": "Scope",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Scope",
+                    "activity_description": "Context: A Grade 6 social studies question about Roman aqueducts asks students to calculate the water flow rate using a fluid dynamics formula."
+                },
+                "output": {
+                    "trait": "Scope",
+                    "validity": false,
+                    "reasoning": "The question assesses advanced physics and engineering concepts, which are outside the scope of a Grade 6 social studies curriculum."
+                }
+            }
+        ]
+    },
+    "Background": {
+        "definition": "Students have the required background to understand and solve the activity.",
+        "note": "Does the provided passage or lecture give students all the information they need to answer?",
+        "evaluation_questions": [
+            "What prerequisite knowledge does the question assume?",
+            "Is all necessary information contained within the provided passage/hint?",
+            "Is it reasonable to expect a student at this grade level to know any unstated information?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Background",
+                    "activity_description": "Context: A passage describes a student's experiment building a solar oven. The question asks which material performed best, based only on the temperature data provided in the passage."
+                },
+                "output": {
+                    "trait": "Background",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Background",
+                    "activity_description": "Context: A passage describes a student's experiment with a solar oven. The question asks for the specific brand of the thermometer used in the experiment."
+                },
+                "output": {
+                    "trait": "Background",
+                    "validity": false,
+                    "reasoning": "The question requires external knowledge not provided in the passage and not reasonable to expect from the student."
+                }
+            }
+        ]
+    },
+    "Clarity": {
+        "definition": "The activity describes the context, task and intended outcome unambiguously. The solution is clear and all the steps, decisions and alternatives are outlined.",
+        "note": "Are the passage, question, and options perfectly clear and free of contradiction?",
+        "evaluation_questions": [
+            "Could the question or any of the choices be interpreted in multiple ways?",
+            "Does the passage contain confusing language or contradictory information?",
+            "Is it obvious what the student is being asked to do?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Clarity",
+                    "activity_description": "Question: 'Based on the data in the passage, what was Maria trying to test?' Passage: '...to see which material was a better insulator, Maria measured the temperature of each oven.'"
+                },
+                "output": {
+                    "trait": "Clarity",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Clarity",
+                    "activity_description": "Question: 'What was the result of the thing?' Choices: ['It was good', 'It was hot', 'The material was effective']"
+                },
+                "output": {
+                    "trait": "Clarity",
+                    "validity": false,
+                    "reasoning": "The question 'What was the result of the thing?' is extremely vague. The choices are also ambiguous without clear context."
+                }
+            }
+        ]
+    },
+    "Conciseness": {
+        "definition": "The problem statement is succinct, avoiding repetition and verbosity.",
+        "note": "Does the passage get to the point, or is it full of distracting fluff?",
+        "evaluation_questions": [
+            "Is there repetitive phrasing in the passage or question?",
+            "Could any information be removed from the passage without affecting the ability to answer the question?",
+            "Is the core information buried in a long, rambling narrative?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Conciseness",
+                    "activity_description": "Passage: 'To test insulators, Maria built two solar ovens. One used wool and the other used newspaper. She measured the temperature in each after one hour.'"
+                },
+                "output": {
+                    "trait": "Conciseness",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Conciseness",
+                    "activity_description": "Passage: 'Maria, a 7th grader who loved science, decided her project for the annual science fair would be about solar power. On a sunny Saturday, after walking her dog, she gathered materials to see which insulator was best...'"
+                },
+                "output": {
+                    "trait": "Conciseness",
+                    "validity": false,
+                    "reasoning": "The passage is verbose and contains irrelevant details (her grade, the science fair, her dog) that distract from the core experimental information."
+                }
+            }
+        ]
+    },
+    "Reliability": {
+        "definition": "It is possible to consistently evaluate the correctness of a candidate solution.",
+        "note": "Is there a single, objective correct answer among the choices?",
+        "evaluation_questions": [
+            "Is the correct answer clearly supported by the problem's context?",
+            "Could different experts reasonably disagree on which choice is the best answer?",
+            "Is the correctness of the answer based on opinion or objective fact?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Reliability",
+                    "activity_description": "Question: 'What was the temperature of the wool-insulated oven?' Answer is based on the explicit statement 'the wool oven reached 85 degrees' in the passage."
+                },
+                "output": {
+                    "trait": "Reliability",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Reliability",
+                    "activity_description": "Question: 'Which of the following is the most creative use for a solar oven?'"
+                },
+                "output": {
+                    "trait": "Reliability",
+                    "validity": false,
+                    "reasoning": "The evaluation is subjective. What one person considers 'creative' another may not, making consistent scoring impossible."
+                }
+            }
+        ]
+    },
+    "Discrimination": {
+        "definition": "Distractors are effective at drawing incorrect answers.",
+        "note": "Are the wrong multiple-choice options tempting because they reflect common mistakes?",
+        "evaluation_questions": [
+            "Do the incorrect options (distractors) represent common student misconceptions or misinterpretations of the text?",
+            "Are any distractors obviously wrong or nonsensical?",
+            "Are the distractors plausible enough to challenge a student who is uncertain?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Discrimination",
+                    "activity_description": "Question: 'What was the primary function of a Roman aqueduct?' Correct Answer: 'To transport water'. Plausible Distractors: 'To serve as a defensive wall', 'To be a road for carts'."
+                },
+                "output": {
+                    "trait": "Discrimination",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Discrimination",
+                    "activity_description": "Question: 'What was the primary function of a Roman aqueduct?' Correct Answer: 'To transport water'. Absurd Distractors: 'To store dinosaur bones', 'To fly to the moon'."
+                },
+                "output": {
+                    "trait": "Discrimination",
+                    "validity": false,
+                    "reasoning": "The distractors are nonsensical and implausible, making the correct answer obvious without any specific knowledge."
+                }
+            }
+        ]
+    },
+    "Correctness": {
+        "definition": "The problem statement does not contain errors, missing or inconsistent data. The solution fulfills all the requirements and contains no errors or omissions. All valid solutions have been characterized & invalid alternatives are indeed invalid.",
+        "note": "Are all facts in the passage, question, and answer technically accurate?",
+        "evaluation_questions": [
+            "Are there any factual, spelling, or grammatical errors in the text?",
+            "Is the provided answer key or solution factually correct?",
+            "Does the passage contain any information that is demonstrably false?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Correctness",
+                    "activity_description": "A passage correctly states that Roman aqueducts used gravity to transport water over long distances. The provided answer key confirms this."
+                },
+                "output": {
+                    "trait": "Correctness",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Correctness",
+                    "activity_description": "A passage about a science experiment states, 'The thermometer showed a reading of 50 degrees Celsius (which is equal to 100 degrees Fahrenheit).'"
+                },
+                "output": {
+                    "trait": "Correctness",
+                    "validity": false,
+                    "reasoning": "The passage contains a factual error; 50°C is equal to 122°F, not 100°F."
+                }
+            }
+        ]
+    },
+    "Difficulty": {
+        "definition": "The activity is neither obvious nor impossible: it is challenging yet feasible.",
+        "note": "Is this question challenging but feasible for a student in the specified grade?",
+        "evaluation_questions": [
+            "Would a typical student at this grade level find the task trivial?",
+            "Would a typical student at this grade level find the task unreasonably difficult?",
+            "Does the required thinking (e.g., recall vs. synthesis) match the grade level?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Difficulty",
+                    "activity_description": "A Grade 7 science question asks students to infer which of two tested materials is the better insulator based on temperature data provided in a passage."
+                },
+                "output": {
+                    "trait": "Difficulty",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Difficulty",
+                    "activity_description": "A Grade 7 science question asks students to write a full thermodynamic model of heat loss for a solar oven."
+                },
+                "output": {
+                    "trait": "Difficulty",
+                    "validity": false,
+                    "reasoning": "The task requires advanced university-level physics, making it impossibly difficult for a Grade 7 student."
+                }
+            }
+        ]
+    },
+    "Workload": {
+        "definition": "The activity takes an average student a reasonable amount of time to be solved.",
+        "note": "Is the time needed to read the passage and answer the question reasonable for a test item?",
+        "evaluation_questions": [
+            "How long would it take an average student at this grade level to read and understand the passage?",
+            "Is the length and complexity of the text appropriate for a single question?",
+            "Does the question require an excessive amount of searching or calculation?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Workload",
+                    "activity_description": "A single multiple-choice question is based on a two-paragraph passage that can be read in under a minute."
+                },
+                "output": {
+                    "trait": "Workload",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Workload",
+                    "activity_description": "A single multiple-choice question requires the student to first read a 10-page chapter from a textbook."
+                },
+                "output": {
+                    "trait": "Workload",
+                    "validity": false,
+                    "reasoning": "The amount of reading required (workload) is unreasonable for a single test question."
+                }
+            }
+        ]
+    },
+    "Format": {
+        "definition": "The description of the activity adheres to the requested format or template.",
+        "note": "Does the question adhere to all specified formatting and style guidelines?",
+        "evaluation_questions": [
+            "Does the question use the correct formatting for text, choices, and images?",
+            "Are there any issues like broken links, missing images, or garbled text?",
+            "Does the item follow the platform's technical specifications?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Format",
+                    "activity_description": "The question, choices, and passage are all correctly formatted as plain text, and any associated image file loads correctly."
+                },
+                "output": {
+                    "trait": "Format",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Format",
+                    "activity_description": "The text for the choices contains un-rendered markdown, like `**Choice A**` instead of a bolded 'Choice A'."
+                },
+                "output": {
+                    "trait": "Format",
+                    "validity": false,
+                    "reasoning": "The item contains formatting errors that make the choices difficult to read or interpret."
+                }
+            }
+        ]
+    },
+    "Accessibility": {
+        "definition": "The activity can be understood and solved by students with special needs.",
+        "note": "Can this question be answered by students using assistive technologies like screen readers or those with color blindness?",
+        "evaluation_questions": [
+            "If an image is present, is it purely decorative or does it have a meaningful text alternative (alt-text)?",
+            "Does the question rely solely on color to convey critical information?",
+            "Is all text machine-readable and not trapped within an image?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Accessibility",
+                    "activity_description": "An image of a solar oven is included for visual interest, but the question can be answered entirely from the text-based passage."
+                },
+                "output": {
+                    "trait": "Accessibility",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Accessibility",
+                    "activity_description": "A question about a chart asks 'What is the value of the red bar?' The only distinguishing feature of the bars is their color."
+                },
+                "output": {
+                    "trait": "Accessibility",
+                    "validity": false,
+                    "reasoning": "The question is unsolvable for a user with color blindness as it relies exclusively on color to convey critical information."
+                }
+            }
+        ]
+    },
+    "Authenticity": {
+        "definition": "The activity captures a realistic scenario that is relevant to students and the field.",
+        "note": "Does the scenario in the passage describe a plausible, real-world type of problem?",
+        "evaluation_questions": [
+            "Does the problem relate to a realistic application in science, history, etc.?",
+            "Is the scenario something students might encounter or read about in a real-world context?",
+            "Does the problem feel meaningful, or is it abstract and contrived?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Authenticity",
+                    "activity_description": "A science question is based on a student designing a simple experiment to test which materials make the best insulators for a homemade solar oven."
+                },
+                "output": {
+                    "trait": "Authenticity",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Authenticity",
+                    "activity_description": "A science question is framed around an alchemist trying to turn lead into gold by mixing it with different potions."
+                },
+                "output": {
+                    "trait": "Authenticity",
+                    "validity": false,
+                    "reasoning": "The scenario is contrived and fantastical, lacking connection to authentic scientific practices."
+                }
+            }
+        ]
+    },
+    "Inclusivity": {
+        "definition": "The activity does not contain inappropriate or biased content.",
+        "note": "Does the question's passage, choices, or premise avoid stereotypes and potentially offensive content?",
+        "evaluation_questions": [
+            "Does the content rely on or reinforce cultural, gender, or social stereotypes?",
+            "Could any part of the question be considered insensitive or exclusionary?",
+            "Are names and roles in the problem presented in a diverse and representative way?"
+        ],
+        "examples": [
+            {
+                "input": {
+                    "trait": "Inclusivity",
+                    "activity_description": "A passage about a team project uses names from a variety of cultural backgrounds (e.g., Maria, Kenji, Omar)."
+                },
+                "output": {
+                    "trait": "Inclusivity",
+                    "validity": true
+                }
+            },
+            {
+                "input": {
+                    "trait": "Inclusivity",
+                    "activity_description": "A math problem states: 'On Saturday, Sarah spent €45 on makeup and €90 on a new handbag. Her husband, David, spent €60 on tickets to a football game. What was the total amount they spent?'"
+                },
+                "output": {
+                    "trait": "Inclusivity",
+                    "validity": false,
+                    "reasoning": "The problem reinforces gender stereotypes by associating the woman's spending with makeup and fashion, and the man's spending with sports."
+                }
+            }
+        ]
+    },
+    "Validity": {
+        "definition": "The activity tests a relevant skill considering all its relevant perspectives.",
+        "note": "Does answering this question correctly truly demonstrate the intended skill, or is there a loophole?",
+        "evaluation_questions": [
+            "What is the intended skill (e.g., 'Interpreting data')?",
+            "Does the question require genuine use of that skill (e.g., comparison and inference)?",
+            "Could a student get the right answer by using a simpler skill (e.g., just matching keywords from the passage to the choices)?"
+        ],
+        "examples": [
+        {
+            "input": {
+                "trait": "Validity",
+                "activity_description": "Skill: 'Analyze a circuit diagram'. A diagram shows two light bulbs connected in a single loop (series) to a battery. The question asks, 'What will happen to the second bulb if the first bulb burns out?'"
+            },
+            "output": {
+                "trait": "Validity",
+                "validity": true
+            }
+        },
+        {
+            "input": {
+                "trait": "Validity",
+                "activity_description": "Skill: 'Analyze a circuit diagram'. The same diagram showing two bulbs and one battery is presented. The question asks, 'How many light bulbs are in the diagram?'"
+            },
+            "output": {
+                "trait": "Validity",
+                "validity": false,
+                "reasoning": "This is not a valid test of 'Analysis.' The question can be answered by simple counting, a much lower-level skill. It doesn't require any understanding of how the circuit works, thereby bypassing the intended skill entirely."
+            }
+        }
+    ]
+    }
+}

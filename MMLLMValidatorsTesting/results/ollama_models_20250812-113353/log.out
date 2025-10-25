@@ -1,0 +1,28 @@
+Loading environment variables from secrets.env...
+✅ Python virtual environment activated.
+Executing Python script: src/main.py
+Arguments passed: -m L_MistralSmall3124B,L_MistralSmall3224B -n 100 -o results/ollama_models_20250812-113353
+Attempting to load environment variables from: /mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/secrets.env
+✅ Environment variables loaded.
+/mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/secrets.env
+Attempting to load configuration from: /mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/src/config/config.toml
+✅ Configuration loaded and processed successfully.
+🧪 Processing 100 questions for the following models: ['L_MistralSmall3124B', 'L_MistralSmall3224B']
+
+====================
+🔬 Processing Model: L_MistralSmall3124B
+====================
+
+====================
+🔬 Processing Model: L_MistralSmall3224B
+====================
+💾 Raw results saved to results/ollama_models_20250812-113353/raw_evaluation_results.csv
+🧹 Cleaned results: 3600 rows -> 3600 rows
+
+✅ All evaluations complete. Clean results saved to results/ollama_models_20250812-113353/clean_evaluation_results.csv
+
+📊 Starting post-evaluation analysis...
+✅ Summary saved to results/ollama_models_20250812-113353/evaluation_summary.csv
+✅ Plot saved to results/ollama_models_20250812-113353/accuracy_boxplot.png
+✅ Statistical summary and plots have been generated.
+❌ Python script failed with exit code: 1
