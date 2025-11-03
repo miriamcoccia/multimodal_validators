@@ -242,7 +242,36 @@ async def main(args):
     if args.batch:
         print("\n🚀 BATCH MODE: Collecting requests...")
 
-        # The test_models_batch function is now much simpler
+        # If a pre-built JSONL file was provided, skip generating requests
+        if args.batch_file:
+            provided = Path(args.batch_file)
+            if not provided.exists():
+                print(f"❌ Provided batch file does not exist: {provided}")
+                return
+
+            # Determine provider from flag
+            if args.provider == "openai":
+                # Submit existing OpenAI jsonl file
+                openai_file = provided
+                print(f"📤 Submitting existing OpenAI batch file: {openai_file}")
+                if args.submit_batch:
+                    batch_id = orchestrator.openai_batch_service.submit_batch(str(openai_file), args.batch_name)
+                    print(f"➡️ Submitted OpenAI batch id: {batch_id}")
+                    if batch_id and args.monitor:
+                        await monitor_batch_progress(batch_id, orchestrator.openai_batch_service, args.check_interval)
+            elif args.provider == "nebius":
+                nebius_file = provided
+                print(f"📤 Submitting existing Nebius batch file: {nebius_file}")
+                if args.submit_batch:
+                    batch_id = orchestrator.nebius_batch_service.submit_batch(str(nebius_file), args.batch_name)
+                    print(f"➡️ Submitted Nebius batch id: {batch_id}")
+                    if batch_id and args.monitor:
+                        await monitor_batch_progress(batch_id, orchestrator.nebius_batch_service, args.check_interval)
+            else:
+                print(f"❌ Unsupported provider for direct file submission: {args.provider}")
+            return  # done
+
+        # --- Otherwise: generate requests as before ---
         all_requests = await test_models_batch(model_ids_to_test, test_df, orchestrator)
 
         openai_requests = []
@@ -255,41 +284,29 @@ async def main(args):
             elif provider == "nebius":
                 nebius_requests.append(request)
 
+        # If we have OpenAI requests, write or submit
         if openai_requests:
+            # Default destination path from config (unchanged)
             openai_file = Path(settings["paths"]["batch_request_file"])
-            orchestrator.openai_batch_service.write_jsonl_file(
-                openai_requests, str(openai_file)
-            )
+            orchestrator.openai_batch_service.write_jsonl_file(openai_requests, str(openai_file))
             print(f"💾 Saved {len(openai_requests)} OpenAI requests to: {openai_file}")
 
             if args.submit_batch:
-                batch_id = orchestrator.openai_batch_service.submit_batch(
-                    str(openai_file), args.batch_name
-                )
+                batch_id = orchestrator.openai_batch_service.submit_batch(str(openai_file), args.batch_name)
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(
-                        batch_id, orchestrator.openai_batch_service, args.check_interval
-                    )
-        if nebius_requests:
-            # Creating Nebius filename by adding _nebius suffix
-            base_path = Path(settings["paths"]["batch_request_file"])
-            nebius_file = base_path.with_name(
-                f"{base_path.stem}_nebius{base_path.suffix}"
-            )
+                    await monitor_batch_progress(batch_id, orchestrator.openai_batch_service, args.check_interval)
 
-            orchestrator.nebius_batch_service.write_jsonl_file(
-                nebius_requests, str(nebius_file)
-            )
+        # Nebius requests: write or submit
+        if nebius_requests:
+            base_path = Path(settings["paths"]["batch_request_file"])
+            nebius_file = base_path.with_name(f"{base_path.stem}_nebius{base_path.suffix}")
+            orchestrator.nebius_batch_service.write_jsonl_file(nebius_requests, str(nebius_file))
             print(f"💾 Saved {len(nebius_requests)} Nebius requests to: {nebius_file}")
 
             if args.submit_batch:
-                batch_id = orchestrator.nebius_batch_service.submit_batch(
-                    str(nebius_file), args.batch_name
-                )
+                batch_id = orchestrator.nebius_batch_service.submit_batch(str(nebius_file), args.batch_name)
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(
-                        batch_id, orchestrator.nebius_batch_service, args.check_interval
-                    )
+                    await monitor_batch_progress(batch_id, orchestrator.nebius_batch_service, args.check_interval)
 
 
 if __name__ == "__main__":
@@ -302,6 +319,14 @@ if __name__ == "__main__":
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Set the logging level (default: INFO).",
     )
+
+    parser.add_argument(
+        "--batch-file",
+        type=str,
+        default=None,
+        help="Path to an existing JSONL batch file to submit (skip writing new JSONL).",
+    )
+
 
     parser.add_argument(
         "-p",

@@ -1955,7 +1955,36 @@ async def main(args):
     if args.batch:
         print("\n🚀 BATCH MODE: Collecting requests...")
 
-        # The test_models_batch function is now much simpler
+        # If a pre-built JSONL file was provided, skip generating requests
+        if args.batch_file:
+            provided = Path(args.batch_file)
+            if not provided.exists():
+                print(f"❌ Provided batch file does not exist: {provided}")
+                return
+
+            # Determine provider from flag
+            if args.provider == "openai":
+                # Submit existing OpenAI jsonl file
+                openai_file = provided
+                print(f"📤 Submitting existing OpenAI batch file: {openai_file}")
+                if args.submit_batch:
+                    batch_id = orchestrator.openai_batch_service.submit_batch(str(openai_file), args.batch_name)
+                    print(f"➡️ Submitted OpenAI batch id: {batch_id}")
+                    if batch_id and args.monitor:
+                        await monitor_batch_progress(batch_id, orchestrator.openai_batch_service, args.check_interval)
+            elif args.provider == "nebius":
+                nebius_file = provided
+                print(f"📤 Submitting existing Nebius batch file: {nebius_file}")
+                if args.submit_batch:
+                    batch_id = orchestrator.nebius_batch_service.submit_batch(str(nebius_file), args.batch_name)
+                    print(f"➡️ Submitted Nebius batch id: {batch_id}")
+                    if batch_id and args.monitor:
+                        await monitor_batch_progress(batch_id, orchestrator.nebius_batch_service, args.check_interval)
+            else:
+                print(f"❌ Unsupported provider for direct file submission: {args.provider}")
+            return  # done
+
+        # --- Otherwise: generate requests as before ---
         all_requests = await test_models_batch(model_ids_to_test, test_df, orchestrator)
 
         openai_requests = []
@@ -1968,41 +1997,29 @@ async def main(args):
             elif provider == "nebius":
                 nebius_requests.append(request)
 
+        # If we have OpenAI requests, write or submit
         if openai_requests:
+            # Default destination path from config (unchanged)
             openai_file = Path(settings["paths"]["batch_request_file"])
-            orchestrator.openai_batch_service.write_jsonl_file(
-                openai_requests, str(openai_file)
-            )
+            orchestrator.openai_batch_service.write_jsonl_file(openai_requests, str(openai_file))
             print(f"💾 Saved {len(openai_requests)} OpenAI requests to: {openai_file}")
 
             if args.submit_batch:
-                batch_id = orchestrator.openai_batch_service.submit_batch(
-                    str(openai_file), args.batch_name
-                )
+                batch_id = orchestrator.openai_batch_service.submit_batch(str(openai_file), args.batch_name)
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(
-                        batch_id, orchestrator.openai_batch_service, args.check_interval
-                    )
-        if nebius_requests:
-            # Creating Nebius filename by adding _nebius suffix
-            base_path = Path(settings["paths"]["batch_request_file"])
-            nebius_file = base_path.with_name(
-                f"{base_path.stem}_nebius{base_path.suffix}"
-            )
+                    await monitor_batch_progress(batch_id, orchestrator.openai_batch_service, args.check_interval)
 
-            orchestrator.nebius_batch_service.write_jsonl_file(
-                nebius_requests, str(nebius_file)
-            )
+        # Nebius requests: write or submit
+        if nebius_requests:
+            base_path = Path(settings["paths"]["batch_request_file"])
+            nebius_file = base_path.with_name(f"{base_path.stem}_nebius{base_path.suffix}")
+            orchestrator.nebius_batch_service.write_jsonl_file(nebius_requests, str(nebius_file))
             print(f"💾 Saved {len(nebius_requests)} Nebius requests to: {nebius_file}")
 
             if args.submit_batch:
-                batch_id = orchestrator.nebius_batch_service.submit_batch(
-                    str(nebius_file), args.batch_name
-                )
+                batch_id = orchestrator.nebius_batch_service.submit_batch(str(nebius_file), args.batch_name)
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(
-                        batch_id, orchestrator.nebius_batch_service, args.check_interval
-                    )
+                    await monitor_batch_progress(batch_id, orchestrator.nebius_batch_service, args.check_interval)
 
 
 if __name__ == "__main__":
@@ -2015,6 +2032,14 @@ if __name__ == "__main__":
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Set the logging level (default: INFO).",
     )
+
+    parser.add_argument(
+        "--batch-file",
+        type=str,
+        default=None,
+        help="Path to an existing JSONL batch file to submit (skip writing new JSONL).",
+    )
+
 
     parser.add_argument(
         "-p",
@@ -2755,6 +2780,144 @@ class ResultsHandler:
                 print(f"  {col}: {complete_pct:.1f}% complete")
 
         return clean_df
+
+--------------------------------------------------
+src/run_all_models.py
+--------------------------------------------------
+#!/usr/bin/env python3
+import asyncio
+import logging
+from pathlib import Path
+import pandas as pd
+from datetime import datetime
+
+from src.config import settings
+from src.orchestrator import Orchestrator
+from src.img_traits_def import ImgTraitDefinition
+from src.science_qa import ScienceQA
+
+
+# ---------- PROVIDER DETECTION ----------
+def get_provider_from_model_id(model_id: str) -> str:
+    """Determines provider based on model ID pattern."""
+    mid = model_id.upper()
+    if mid.startswith("GPT"):        # e.g., GPT4o, GPT4oMini
+        return "openai"
+    elif mid.startswith("L_"):       # e.g., L_Gemma34B, L_Qwen25VL72B
+        return "nebius"
+    raise ValueError(f"❌ Could not determine provider for model '{model_id}'")
+
+
+# ---------- CLEANING UTIL ----------
+def clean_requests(requests: list) -> list:
+    """Remove internal metadata before writing to JSONL."""
+    return [{k: v for k, v in r.items() if not k.startswith("_")} for r in requests]
+
+
+# ---------- MAIN RUNNER ----------
+async def run_all_models(num_questions: int = 100):
+    """Prepare batch JSONL files for all models defined in config (OpenAI + Nebius)."""
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logger = logging.getLogger("run_all_models")
+    logger.info("🚀 Starting batch preparation for all models...")
+
+    # --- Load models from config ---
+    all_models = settings.get("all_models", {})
+    if not all_models:
+        raise RuntimeError("❌ No models found in settings['all_models']!")
+
+    logger.info(f"🧠 Found {len(all_models)} total models to process:")
+    for m in all_models:
+        provider = get_provider_from_model_id(m)
+        logger.info(f"   • {m} ({provider})")
+
+    # --- Load dataset ---
+    csv_path = Path(settings["paths"]["input_data_csv"])
+    df = pd.read_csv(csv_path).head(num_questions)
+    logger.info(f"📚 Loaded {len(df)} questions from: {csv_path.resolve()}")
+
+    # --- Initialize orchestrator and traits ---
+    trait_def = ImgTraitDefinition(Path(settings["paths"]["trait_definitions_json"]))
+    orchestrator = Orchestrator(
+        trait_names=list(trait_def.traits.keys()),
+        checkpoint_file=settings["paths"]["checkpoint_json"],
+    )
+
+    # --- Start processing ---
+    all_requests = []
+    total_models = len(all_models)
+    total_questions = len(df)
+    total_ops = total_models * total_questions
+    current_op = 0
+
+    start_time = datetime.now()
+    logger.info("🕓 Beginning request generation...\n")
+
+    for model_idx, model_id in enumerate(all_models.keys(), 1):
+        provider = get_provider_from_model_id(model_id)
+        logger.info(f"⚙️  [{model_idx}/{total_models}] Running model: {model_id} ({provider})")
+
+        for i, (_, row) in enumerate(df.iterrows(), 1):
+            question = ScienceQA.from_df_row(row)
+            requests, _ = await orchestrator.prepare_batch_requests(question, provider, model_id)
+
+            # Add temporary provider tag
+            for r in requests:
+                r["_provider"] = provider
+
+            all_requests.extend(requests)
+            current_op += 1
+
+            if i % 10 == 0 or i == len(df):
+                logger.info(f"   📈 {i}/{len(df)} questions processed for {model_id}")
+
+        logger.info(f"✅ Finished model {model_id} ({provider}) — total requests so far: {len(all_requests)}\n")
+
+    elapsed = (datetime.now() - start_time).total_seconds() / 60
+    logger.info(f"🧮 Request generation completed in {elapsed:.2f} min")
+    logger.info(f"📦 Total collected requests: {len(all_requests)}")
+
+    # --- Split and clean requests ---
+    openai_reqs = clean_requests([r for r in all_requests if r.get("_provider") == "openai"])
+    nebius_reqs = clean_requests([r for r in all_requests if r.get("_provider") == "nebius"])
+
+    logger.info(f"📊 Split summary → OpenAI: {len(openai_reqs)} | Nebius: {len(nebius_reqs)}")
+
+    # --- Write JSONL batch files ---
+    base_path = Path(settings["paths"]["batch_request_file"])
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if openai_reqs:
+        openai_path = base_path.with_name(f"{base_path.stem}_openai_{timestamp}{base_path.suffix}")
+        orchestrator.openai_batch_service.write_jsonl_file(openai_reqs, str(openai_path))
+        logger.info(f"💾 OpenAI batch saved → {openai_path.resolve()}")
+
+    if nebius_reqs:
+        nebius_path = base_path.with_name(f"{base_path.stem}_nebius_{timestamp}{base_path.suffix}")
+        orchestrator.nebius_batch_service.write_jsonl_file(nebius_reqs, str(nebius_path))
+        logger.info(f"💾 Nebius batch saved → {nebius_path.resolve()}")
+
+    # --- Summary and next steps ---
+    logger.info("\n🎉 All model batches prepared successfully!")
+    logger.info("📍 Batch file locations:")
+    if openai_reqs:
+        logger.info(f"   • OpenAI → {openai_path.name}")
+    if nebius_reqs:
+        logger.info(f"   • Nebius → {nebius_path.name}")
+    logger.info("\n📤 To submit and monitor:")
+    logger.info("   python src/main.py --provider openai --batch --submit-batch --monitor")
+    logger.info("   python src/main.py --provider nebius --batch --submit-batch --monitor")
+    logger.info("\n✨ Done!")
+
+
+# ---------- ENTRY POINT ----------
+if __name__ == "__main__":
+    asyncio.run(run_all_models())
 
 --------------------------------------------------
 src/science_qa.py

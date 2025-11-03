@@ -103,7 +103,7 @@ class TraitAgent:
         self,
         question_data: ScienceQA,
         provider: str,
-        model_id: str,
+        model_id: str, 
         pil_images: Optional[List[Image.Image]] = None,
         image_file_ids: Optional[List[str]] = None,
     ):
@@ -111,7 +111,7 @@ class TraitAgent:
             qid = question_data.id
             if provider == "openai":
                 model = settings["models"]["openai"][model_id]
-                request_url = "/v1/responses"
+                request_url = "/v1/responses" 
             elif provider == "nebius":
                 model = settings["models"]["nebius"][model_id]
                 request_url = "/v1/chat/completions"
@@ -137,12 +137,10 @@ class TraitAgent:
 
             # Different payload based on provider
             if provider == "openai":
-                # OpenAI uses Responses API format
+                # OpenAI uses Responses API format (as requested)
                 payload = {
                     "model": model,
                     "instructions": self.system_prompt,
-                    "temperature": 0,
-                    "top_p": 1,
                     "max_output_tokens": max_out,
                     "input": inputs,
                     "text": {
@@ -154,12 +152,15 @@ class TraitAgent:
                         },
                     },
                 }
+                
+                # GPT5 does not take temperature or top_p parameters in the payload
+                if not model_id.startswith("GPT5"):
+                    payload["temperature"] = 0
+                    payload["top_p"] = 1
+
             else:  # nebius
-                # Nebius uses Chat Completions format
-                # Convert inputs to messages array
                 messages = [{"role": "system", "content": self.system_prompt}]
 
-                # Add user messages from inputs
                 for msg in inputs:
                     if msg.get("role") == "user":
                         messages.append(msg)
@@ -176,9 +177,12 @@ class TraitAgent:
                         },
                     },
                     "max_tokens": max_out,
-                    "temperature": 0,
-                    "top_p": 1,
                 }
+
+
+                if not model_id.startswith("GPT5"):
+                    payload["temperature"] = 0
+                    payload["top_p"] = 1
 
             request_text = {
                 "custom_id": request_id,

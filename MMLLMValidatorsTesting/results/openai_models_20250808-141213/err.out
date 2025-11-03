@@ -1,5 +1,0 @@
-/mnt/beegfs/gpfs/filesets/project_2024_OAT/MultimodalLLMs/MMLLMValidatorsTesting/src/statistics.py:56: FutureWarning: 
-
-Passing `palette` without assigning `hue` is deprecated and will be removed in v0.14.0. Assign the `x` variable to `hue` and set `legend=False` for the same effect.
-
-  sns.boxplot(
