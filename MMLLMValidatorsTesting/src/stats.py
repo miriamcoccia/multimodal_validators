@@ -47,6 +47,32 @@ class Statistics:
             raise ValueError("Input DataFrame must contain a 'validity' column.")
         self.df["validity"] = self.df["validity"].astype(bool)
 
+        # --- NEW: Standardize model_id from custom_id ---
+        # This overrides the model_id column with the alias from custom_id
+        # to fix any upstream overwrites (e.g., being set to model_reported).
+        if "custom_id" in self.df.columns:
+            print("Standardizing model_id from custom_id...")
+            # Regex: captures "L_Gemma327B" from "request-L_Gemma327B-..."
+            self.df["model_id"] = self.df["custom_id"].str.extract(
+                r"^request-([^-]+)-", expand=False
+            )
+            
+            # Optional: Standardize names for cleaner plot labels
+            # (You can customize this dictionary based on your needs)
+            replacements = {
+                "L_Gemma327B": "Gemma-3-27B",
+                "L_Qwen25VL72B": "Qwen2.5-VL-72B",
+                "gpt-5-mini": "GPT-5-Mini",
+                "gpt-4o-mini": "GPT-4o-Mini"
+            }
+            # Use .replace() to swap values, keep original if no match
+            self.df["model_id"] = self.df["model_id"].replace(replacements)
+            
+            print("Standardized Model IDs:", self.df["model_id"].unique())
+        else:
+            print("Warning: 'custom_id' column not found, using existing 'model_id'.")
+        # --- End of new section ---
+
         # --- Ground truth handling ---
         # Either use provided ground truth, auto-detect, or synthesize all-True labels.
         self.ground_truth_col = ground_truth_col or next(
