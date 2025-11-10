@@ -135,13 +135,13 @@
       }
     ]
   },
-  "Text-Image Coherence": {
-    "definition": "This trait assesses whether the image and text components of a question convey consistent information without contradictions or unnecessary spatial separation. Misalignment can alter the interpretation of the question or create a split-attention effect.",
-    "note": "Do the text and the image tell the same story without contradicting each other?",
+    "Text-Image Coherence": {
+    "definition": "This trait assesses whether the image and the QUESTION STEM (the setup text or premise, NOT the answer options) convey CONSISTENT INFORMATION WITHOUT CONTRADICTIONS or unnecessary spatial separation.",
+    "note": "Do the QUESTION STEM and the image tell the same story? CRUCIALLY, IGNORE THE ANSWER OPTIONS (A, B, C, D) FOR THIS CHECK. Distractors are often meant to contradict the image or stem; this is not a failure of coherence.",
     "evaluation_questions": [
-      "Does any information presented in the image contradict information given in the question text or options?",
-      "Are the elements, labels, or terms used in the text correctly and consistently represented in the image?",
-      "Are the text and image components placed together logically to avoid forcing the student to split their attention?"
+      "Does information presented in the image CONTRADICTS information given in the QUESTION STEM",
+      "Are the elements, labels, or terms used in the QUESTION STEM (if any) correctly and consistently represented in the image?",
+      "Are the QUESTION STEM and image components placed together logically to avoid forcing the student to split their attention?"
     ],
     "examples": [
       {

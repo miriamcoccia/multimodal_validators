@@ -26,7 +26,8 @@ class Orchestrator:
         self.openai_batch_service = OpenAIBatchService()
         self.nebius_batch_service = NebiusBatchService()
 
-        self.all_agents = [TraitAgent(name) for name in trait_names]
+        # self.all_agents = [TraitAgent(name) for name in trait_names]  ALL TRAITS
+        self.all_agents = [TraitAgent(name) for name in trait_names if name=="Text-Image Coherence"]  # JUST TARGET TRAIT WITH NEW PROMPT
         self.checkpoint_file = checkpoint_file
 
         logger.info(f"✅ Orchestrator created with {len(self.all_agents)} agents.")

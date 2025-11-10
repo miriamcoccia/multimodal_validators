@@ -17,6 +17,12 @@ class ResultsHandler:
     )
 
     def __init__(self, results_dir: Path):
+        """
+        Initializes the ResultsHandler.
+
+        Args:
+            results_dir: The directory to store result files.
+        """
         self.RESULTS_DIR = results_dir
         self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -81,20 +87,61 @@ class ResultsHandler:
         return df[cols]
 
     def _parse_batch_object(self, obj: Dict[str, Any], ln: int) -> Dict[str, Any]:
-        """Parse a single JSONL object from the batch output into normalized fields."""
-        custom_id = obj.get("custom_id", "")
-        response = obj.get("response", {}) or {}
-        status_code = response.get("status_code")
-        body = response.get("body", {}) or {}
+        """
+        Parse a single JSONL object from the batch output into normalized fields.
+        Detects the response format (Batch API vs. Chat Completion) and routes parsing.
+        """
+        custom_id: str = obj.get("custom_id", "")
+        response: Dict[str, Any] = obj.get("response", {}) or {}
 
-        # OpenAI response metadata
-        model_reported = body.get("model")
-        created_at = body.get("created_at")
-        req_status = body.get("status")
-        error = body.get("error")
-        request_id = response.get("request_id")
+        text_payload: Optional[str] = None
+        raw_text: Optional[str] = None
 
-        # Derive fields from custom_id
+        # OpenAI response metadata - declare with defaults
+        model_reported: Optional[str] = None
+        created_at: Optional[int] = None
+        req_status: Optional[str] = None
+        error: Optional[Any] = None
+        request_id: Optional[str] = None
+        status_code: Optional[int] = None
+
+        # --- DETECTION LOGIC ---
+
+        # Format 1: New Chat Completion format (e.g., from Gemma, Cohere, etc.)
+        # Has "choices" and "model" directly in the response object.
+        if "choices" in response and "model" in response:
+            status_code = 200 if obj.get("error") is None else 500  # Infer
+            model_reported = response.get("model")
+            created_at = response.get("created")
+            req_status = "completed" if obj.get("error") is None else "failed"
+            error = obj.get("error")
+            request_id = response.get("id")
+
+            text_payload = self._extract_output_text_chat_completion(response)
+
+        # Format 2: Original Batch API format
+        # Has "status_code" and "body" in the response object.
+        elif "status_code" in response and "body" in response:
+            status_code = response.get("status_code")
+            body = response.get("body", {}) or {}
+            model_reported = body.get("model")
+            created_at = body.get("created_at")
+            req_status = body.get("status")
+            error = body.get("error")
+            request_id = response.get("request_id")
+
+            text_payload = self._extract_output_text_batch_api(body)
+
+        # Format 3: Error or unknown structure
+        else:
+            status_code = response.get("status_code")  # Best guess
+            req_status = "unknown_format"
+            error = obj.get("error") or str(response)[:250]  # Save snippet as error
+            request_id = obj.get("id") or response.get("id")
+
+        # --- END DETECTION LOGIC ---
+
+        # Derive fields from custom_id (this logic is unchanged)
         trait_hint = qid = ts = None
         model_alias = None
         m = self.CID_RX.search(custom_id) if isinstance(custom_id, str) else None
@@ -103,11 +150,12 @@ class ResultsHandler:
             trait_hint = m.group("trait")
             qid = m.group("qid")
             ts = m.group("ts")
+        else:
+            # Debug: print problematic custom_ids
+            print(f"Warning: Could not parse custom_id at line {ln}: '{custom_id}'")
 
-        # Extract JSON payload returned by the model (strict schema)
-        text_payload = self._extract_output_text(body)
+        # Extract JSON payload returned by the model
         inner_json: Dict[str, Any] = {}
-        raw_text = None
         if text_payload:
             try:
                 inner_json = json.loads(text_payload)
@@ -133,7 +181,7 @@ class ResultsHandler:
             "model_id": model_alias
             or model_reported,  # prefer alias, fallback to reported
             "trait": trait,
-            "question_id": qid,
+            "question_id": qid,  # This will be None if custom_id parsing failed
             "timestamp_token": ts,
             "validity": validity,
             "reasoning": reasoning,
@@ -141,9 +189,42 @@ class ResultsHandler:
         }
 
     @staticmethod
-    def _extract_output_text(body: Dict[str, Any]) -> Optional[str]:
+    def _extract_output_text_chat_completion(
+        response: Dict[str, Any],
+    ) -> Optional[str]:
         """
-        Extract the inner JSON string emitted by the model under Responses API:
+        Extracts the inner JSON string from a standard Chat Completion API response:
+        response.choices[0].message.content
+        """
+        try:
+            choices = response.get("choices", [])
+            if not isinstance(choices, list) or not choices:
+                return None
+
+            message = choices[0].get("message", {})
+            if not isinstance(message, dict):
+                return None
+
+            content = message.get("content")
+            if not isinstance(content, str):
+                return None
+
+            # Apply the same stripping logic from the original function
+            t = content.strip()
+            if t.startswith("```"):
+                t = t.strip("`")
+                # after stripping ticks, if it contains json prefix, try to cut it down
+                if t.lower().startswith("json"):
+                    t = t[4:].strip()
+            return t
+        except (IndexError, AttributeError, TypeError) as e:
+            print(f"Error parsing chat completion output: {e}")
+            return None
+
+    @staticmethod
+    def _extract_output_text_batch_api(body: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract the inner JSON string emitted by the model under *OLD* Responses API:
         body.output -> list[message]; message.content -> list[parts]; parts[type=="output_text"].text
         """
         out = body.get("output", [])
@@ -195,8 +276,6 @@ class ResultsHandler:
             f"💾 Raw results saved to {self.RAW_RESULTS_FILENAME} ({'OK' if ok else 'MISSING'}, {size} bytes)"
         )
 
-    # Add this method to your ResultsHandler class:
-
     def save_clean_results(self, df: pd.DataFrame):
         """Saves the cleaned DataFrame to a CSV file."""
         self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -207,73 +286,7 @@ class ResultsHandler:
             f"✅ Clean results saved to {self.CLEAN_RESULTS_FILENAME} ({'OK' if ok else 'MISSING'}, {size} bytes)"
         )
 
-    # Also, fix the _parse_batch_object method to handle question_id parsing better:
-
-    def _parse_batch_object(self, obj: Dict[str, Any], ln: int) -> Dict[str, Any]:
-        """Parse a single JSONL object from the batch output into normalized fields."""
-        custom_id = obj.get("custom_id", "")
-        response = obj.get("response", {}) or {}
-        status_code = response.get("status_code")
-        body = response.get("body", {}) or {}
-
-        # OpenAI response metadata
-        model_reported = body.get("model")
-        created_at = body.get("created_at")
-        req_status = body.get("status")
-        error = body.get("error")
-        request_id = response.get("request_id")
-
-        # Derive fields from custom_id
-        trait_hint = qid = ts = None
-        model_alias = None
-        m = self.CID_RX.search(custom_id) if isinstance(custom_id, str) else None
-        if m:
-            model_alias = m.group("model")
-            trait_hint = m.group("trait")
-            qid = m.group("qid")
-            ts = m.group("ts")
-        else:
-            # Debug: print problematic custom_ids
-            print(f"Warning: Could not parse custom_id at line {ln}: '{custom_id}'")
-
-        # Extract JSON payload returned by the model (strict schema)
-        text_payload = self._extract_output_text(body)
-        inner_json: Dict[str, Any] = {}
-        raw_text = None
-        if text_payload:
-            try:
-                inner_json = json.loads(text_payload)
-            except json.JSONDecodeError:
-                raw_text = text_payload  # preserve raw for debugging
-
-        trait = inner_json.get("trait") if inner_json else None
-        if trait is None:
-            trait = trait_hint  # fallback to custom_id
-
-        validity = self._coerce_bool(inner_json.get("validity") if inner_json else None)
-        reasoning = inner_json.get("reasoning") if inner_json else None
-
-        return {
-            "_line": ln,
-            "custom_id": custom_id,
-            "request_id": request_id,
-            "http_status": status_code,
-            "request_status": req_status,
-            "created_at": created_at,
-            "error": error,
-            "model_reported": model_reported,
-            "model_id": model_alias
-            or model_reported,  # prefer alias, fallback to reported
-            "trait": trait,
-            "question_id": qid,  # This will be None if custom_id parsing failed
-            "timestamp_token": ts,
-            "validity": validity,
-            "reasoning": reasoning,
-            "_raw_text": raw_text,
-        }
-
-    # And update the clean_results method to be more informative about the question_id issue:
-
+    # This is your advanced cleaning method, kept intact
     def clean_results(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Filters out rows with errors or invalid data.
@@ -392,6 +405,10 @@ class ResultsHandler:
                 "gpt-4o", na=False
             ) & ~clean_df["model_id"].str.startswith("gpt-4o-mini", na=False)
             clean_df.loc[mask_4o, "model_id"] = "GPT4o"
+            
+            # Handle Gemma
+            mask_gemma = clean_df["model_id"].str.contains("gemma", na=False, case=False)
+            clean_df.loc[mask_gemma, "model_id"] = "Gemma" # Standardize
 
         # Fill missing trait values from custom_id if possible
         if "trait" in clean_df.columns:
