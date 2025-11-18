@@ -17,24 +17,15 @@ class ResultsHandler:
     )
 
     def __init__(self, results_dir: Path):
-        """
-        Initializes the ResultsHandler.
-
-        Args:
-            results_dir: The directory to store result files.
-        """
         self.RESULTS_DIR = results_dir
         self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
         self.RAW_RESULTS_FILENAME = self.RESULTS_DIR / "raw_evaluation_results.csv"
         self.CLEAN_RESULTS_FILENAME = self.RESULTS_DIR / "clean_evaluation_results.csv"
 
-    # ========= New: Batch JSONL ingestion =========
     def load_batch_results_jsonl(self, jsonl_path: Path) -> pd.DataFrame:
         """
-        Load OpenAI Batch Responses API JSONL output and normalize into a DataFrame
-        with canonical columns: question_id, model_id, trait, validity, reasoning, etc.
-        Does NOT modify the JSONL file; purely reads and structures it.
+        Load Batch API JSONL output and normalize into a DataFrame.
         """
         rows: List[Dict[str, Any]] = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -59,11 +50,12 @@ class ResultsHandler:
                     )
                     continue
 
-                rows.append(self._parse_batch_object(obj, ln))
+                # Use extend() to handle multiple rows (flattened traits)
+                rows.extend(self._parse_batch_object(obj, ln))
 
         df = pd.DataFrame(rows)
 
-        # Reorder columns (keep extras at the end)
+        # Reorder columns
         preferred = [
             "custom_id",
             "question_id",
@@ -86,167 +78,52 @@ class ResultsHandler:
         ]
         return df[cols]
 
-    def _parse_batch_object(self, obj: Dict[str, Any], ln: int) -> Dict[str, Any]:
-        """
-        Parse a single JSONL object from the batch output into normalized fields.
-        Detects the response format (Batch API vs. Chat Completion) and routes parsing.
-        """
-        custom_id: str = obj.get("custom_id", "")
-        response: Dict[str, Any] = obj.get("response", {}) or {}
-
-        text_payload: Optional[str] = None
-        raw_text: Optional[str] = None
-
-        # OpenAI response metadata - declare with defaults
-        model_reported: Optional[str] = None
-        created_at: Optional[int] = None
-        req_status: Optional[str] = None
-        error: Optional[Any] = None
-        request_id: Optional[str] = None
-        status_code: Optional[int] = None
-
-        # --- DETECTION LOGIC ---
-
-        # Format 1: New Chat Completion format (e.g., from Gemma, Cohere, etc.)
-        # Has "choices" and "model" directly in the response object.
-        if "choices" in response and "model" in response:
-            status_code = 200 if obj.get("error") is None else 500  # Infer
-            model_reported = response.get("model")
-            created_at = response.get("created")
-            req_status = "completed" if obj.get("error") is None else "failed"
-            error = obj.get("error")
-            request_id = response.get("id")
-
-            text_payload = self._extract_output_text_chat_completion(response)
-
-        # Format 2: Original Batch API format
-        # Has "status_code" and "body" in the response object.
-        elif "status_code" in response and "body" in response:
-            status_code = response.get("status_code")
-            body = response.get("body", {}) or {}
-            model_reported = body.get("model")
-            created_at = body.get("created_at")
-            req_status = body.get("status")
-            error = body.get("error")
-            request_id = response.get("request_id")
-
-            text_payload = self._extract_output_text_batch_api(body)
-
-        # Format 3: Error or unknown structure
-        else:
-            status_code = response.get("status_code")  # Best guess
-            req_status = "unknown_format"
-            error = obj.get("error") or str(response)[:250]  # Save snippet as error
-            request_id = obj.get("id") or response.get("id")
-
-        # --- END DETECTION LOGIC ---
-
-        # Derive fields from custom_id (this logic is unchanged)
-        trait_hint = qid = ts = None
-        model_alias = None
-        m = self.CID_RX.search(custom_id) if isinstance(custom_id, str) else None
-        if m:
-            model_alias = m.group("model")
-            trait_hint = m.group("trait")
-            qid = m.group("qid")
-            ts = m.group("ts")
-        else:
-            # Debug: print problematic custom_ids
-            print(f"Warning: Could not parse custom_id at line {ln}: '{custom_id}'")
-
-        # Extract JSON payload returned by the model
-        inner_json: Dict[str, Any] = {}
-        if text_payload:
-            try:
-                inner_json = json.loads(text_payload)
-            except json.JSONDecodeError:
-                raw_text = text_payload  # preserve raw for debugging
-
-        trait = inner_json.get("trait") if inner_json else None
-        if trait is None:
-            trait = trait_hint  # fallback to custom_id
-
-        validity = self._coerce_bool(inner_json.get("validity") if inner_json else None)
-        reasoning = inner_json.get("reasoning") if inner_json else None
-
-        return {
-            "_line": ln,
-            "custom_id": custom_id,
-            "request_id": request_id,
-            "http_status": status_code,
-            "request_status": req_status,
-            "created_at": created_at,
-            "error": error,
-            "model_reported": model_reported,
-            "model_id": model_alias
-            or model_reported,  # prefer alias, fallback to reported
-            "trait": trait,
-            "question_id": qid,  # This will be None if custom_id parsing failed
-            "timestamp_token": ts,
-            "validity": validity,
-            "reasoning": reasoning,
-            "_raw_text": raw_text,
-        }
-
     @staticmethod
-    def _extract_output_text_chat_completion(
-        response: Dict[str, Any],
-    ) -> Optional[str]:
+    def _extract_output_text(response_obj: Dict[str, Any]) -> Optional[str]:
         """
-        Extracts the inner JSON string from a standard Chat Completion API response:
-        response.choices[0].message.content
+        Extract the inner JSON string emitted by the model.
+        Handles both OpenAI 'Responses' API (body -> output)
+        and Standard/Nebius 'Chat' API (choices -> message -> content).
         """
-        try:
-            choices = response.get("choices", [])
-            if not isinstance(choices, list) or not choices:
-                return None
+        # 1. Normalize: Get the inner 'body' or use response_obj itself if no body wrapper
+        body = response_obj.get("body")
+        if not body:
+            # Nebius often puts 'choices' directly in 'response'
+            body = response_obj
 
-            message = choices[0].get("message", {})
-            if not isinstance(message, dict):
-                return None
-
-            content = message.get("content")
-            if not isinstance(content, str):
-                return None
-
-            # Apply the same stripping logic from the original function
-            t = content.strip()
-            if t.startswith("```"):
-                t = t.strip("`")
-                # after stripping ticks, if it contains json prefix, try to cut it down
-                if t.lower().startswith("json"):
-                    t = t[4:].strip()
-            return t
-        except (IndexError, AttributeError, TypeError) as e:
-            print(f"Error parsing chat completion output: {e}")
-            return None
-
-    @staticmethod
-    def _extract_output_text_batch_api(body: Dict[str, Any]) -> Optional[str]:
-        """
-        Extract the inner JSON string emitted by the model under *OLD* Responses API:
-        body.output -> list[message]; message.content -> list[parts]; parts[type=="output_text"].text
-        """
+        # 2. Try OpenAI "Responses" API format (output_text)
         out = body.get("output", [])
-        if not isinstance(out, list):
-            return None
-        for msg in out:
-            content = msg.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if part.get("type") == "output_text":
-                    text = part.get("text")
-                    if isinstance(text, str):
-                        # strip accidental code fences if present
-                        t = text.strip()
-                        if t.startswith("```"):
-                            t = t.strip("`")
-                            # after stripping ticks, if it contains json prefix, try to cut it down
-                            if t.lower().startswith("json"):
-                                t = t[4:].strip()
-                        return t
+        if isinstance(out, list):
+            for msg in out:
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for part in content:
+                        if part.get("type") == "output_text":
+                            return part.get("text", "")
+
+        # 3. Try Standard Chat Completions format (Nebius/OpenAI Chat)
+        choices = body.get("choices", [])
+        if isinstance(choices, list) and len(choices) > 0:
+            message = choices[0].get("message", {})
+            content = message.get("content")
+            if content:
+                return str(content)
+
         return None
+
+    @staticmethod
+    def _clean_json_text(text: str) -> str:
+        """Strips markdown code fences to ensure json.loads works."""
+        if not isinstance(text, str):
+            return ""
+        t = text.strip()
+        if t.startswith("```"):
+            # Remove first line (e.g. ```json)
+            t = t.split("\n", 1)[-1] if "\n" in t else t
+            # Remove last line (```)
+            if t.endswith("```"):
+                t = t.rsplit("\n", 1)[0] if "\n" in t else t.strip("`")
+        return t.strip()
 
     @staticmethod
     def _coerce_bool(val: Any) -> Optional[bool]:
@@ -265,7 +142,95 @@ class ResultsHandler:
                 return False
         return None
 
-    # ========= Existing CSV helpers (unchanged API) =========
+    def _parse_batch_object(self, obj: Dict[str, Any], ln: int) -> List[Dict[str, Any]]:
+        """Parse a single JSONL object from the batch output into a list of normalized rows."""
+        custom_id = obj.get("custom_id", "")
+        response = obj.get("response", {}) or {}
+        
+        status_code = response.get("status_code")
+        # Nebius might not have a status code in the response dict, usually 200 if present
+        if status_code is None and "choices" in response:
+            status_code = 200
+
+        # Metadata extraction
+        # Check both 'body' and 'response' levels for metadata
+        body = response.get("body") or response
+        
+        model_reported = body.get("model")
+        created_at = body.get("created_at")
+        req_status = body.get("status") 
+        error = obj.get("error") # Check top level error too
+        request_id = response.get("request_id") or body.get("id")
+
+        # Derive fields from custom_id
+        trait_hint = qid = ts = None
+        model_alias = None
+        m = self.CID_RX.search(custom_id) if isinstance(custom_id, str) else None
+        if m:
+            model_alias = m.group("model")
+            trait_hint = m.group("trait") 
+            qid = m.group("qid")
+            ts = m.group("ts")
+
+        # --- Base object for all rows derived from this line ---
+        base_row = {
+            "_line": ln,
+            "custom_id": custom_id,
+            "request_id": request_id,
+            "http_status": status_code,
+            "request_status": req_status,
+            "created_at": created_at,
+            "error": error,
+            "model_reported": model_reported,
+            "model_id": model_alias or model_reported,
+            "question_id": qid,
+            "timestamp_token": ts,
+            "trait": trait_hint,
+            "validity": None,
+            "reasoning": None,
+            "_raw_text": None,
+        }
+
+        # Extract Text Payload
+        raw_text = self._extract_output_text(response)
+        if not raw_text:
+            return [base_row]
+
+        # Clean and Parse JSON
+        cleaned_text = self._clean_json_text(raw_text)
+        try:
+            inner_json = json.loads(cleaned_text)
+        except json.JSONDecodeError:
+            base_row["_raw_text"] = raw_text # preserve raw for debugging
+            return [base_row]
+
+        # --- Logic: Check for combined "traits_output" list ---
+        if isinstance(inner_json.get("traits_output"), list):
+            generated_rows = []
+            for trait_item in inner_json["traits_output"]:
+                if not isinstance(trait_item, dict): continue
+
+                new_row = base_row.copy()
+                # If trait is missing in JSON, fallback to hint (though unlikely for combined)
+                new_row["trait"] = trait_item.get("trait") or trait_hint
+                new_row["validity"] = self._coerce_bool(trait_item.get("validity"))
+                new_row["reasoning"] = trait_item.get("reasoning")
+                generated_rows.append(new_row)
+
+            if not generated_rows: 
+                return [base_row]
+            return generated_rows
+
+        # --- Logic: Single trait structure ---
+        else:
+            # Some models might output { "trait": ..., "validity": ... } directly
+            # Others might output { "validated_trait": { ... } } depending on schema
+            # We assume direct object here based on your previous schema
+            base_row["trait"] = inner_json.get("trait") or trait_hint
+            base_row["validity"] = self._coerce_bool(inner_json.get("validity"))
+            base_row["reasoning"] = inner_json.get("reasoning")
+            return [base_row]
+
     def save_raw_results(self, df: pd.DataFrame):
         """Saves the raw DataFrame of results to a CSV file."""
         self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -286,210 +251,98 @@ class ResultsHandler:
             f"✅ Clean results saved to {self.CLEAN_RESULTS_FILENAME} ({'OK' if ok else 'MISSING'}, {size} bytes)"
         )
 
-    # This is your advanced cleaning method, kept intact
     def clean_results(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Filters out rows with errors or invalid data.
-        Modified to preserve all rows for comparable results by handling missing data gracefully.
         """
         clean_df = df.copy()
 
         print(f"Starting cleaning with {len(clean_df)} rows")
-        print("GOAL: Preserve all rows for comparable results")
 
-        # Diagnostic: Check what's causing question_id to be null
+        # 1. Question ID fallback logic
         if "question_id" in clean_df.columns:
-            null_qid_count = clean_df["question_id"].isna().sum()
-            if null_qid_count > 0:
-                print(f"DIAGNOSTIC: {null_qid_count} rows have null question_id")
-                # Show sample of problematic custom_ids to debug regex issue
-                null_rows = clean_df[clean_df["question_id"].isna()]
-                if "custom_id" in null_rows.columns and not null_rows.empty:
-                    sample_custom_ids = null_rows["custom_id"].head(5).tolist()
-                    print(f"Sample problematic custom_ids: {sample_custom_ids}")
-
-                    # Try to extract question_id from custom_id manually for these rows
-                    def extract_qid_fallback(custom_id):
-                        if pd.isna(custom_id) or custom_id == "":
-                            return None
-                        # Try to find numeric patterns that could be question IDs
-                        import re
-
-                        # Look for patterns like "question_123" or just "123" in the string
-                        patterns = [
-                            r"question[_-](\d+)",
-                            r"qid[_-](\d+)",
-                            r"id[_-](\d+)",
-                            r"-(\d+)-",
-                        ]
-                        for pattern in patterns:
-                            match = re.search(pattern, str(custom_id), re.IGNORECASE)
-                            if match:
-                                return match.group(1)
-                        # Last resort: find any number in the string
-                        numbers = re.findall(r"\d+", str(custom_id))
-                        if numbers:
-                            # Return the longest number found (likely to be question_id)
-                            return max(numbers, key=len)
+            null_qid_mask = clean_df["question_id"].isna()
+            if null_qid_mask.sum() > 0:
+                print(f"DIAGNOSTIC: {null_qid_mask.sum()} rows have null question_id. Attempting recovery.")
+                
+                def extract_qid_fallback(custom_id):
+                    if pd.isna(custom_id) or custom_id == "": 
                         return None
+                    import re
+                    patterns = [r"question[_-](\d+)", r"qid[_-](\d+)", r"id[_-](\d+)", r"-(\d+)-"]
+                    for pattern in patterns: 
+                        match = re.search(pattern, str(custom_id), re.IGNORECASE)
+                        if match: return match.group(1)
+                    numbers = re.findall(r"\d+", str(custom_id))
+                    return max(numbers, key=len) if numbers else None
 
-                    # Try to recover question_ids using fallback method
-                    recovered = null_rows["custom_id"].apply(extract_qid_fallback)
-                    recovered_count = recovered.notna().sum()
-                    print(
-                        f"Fallback method could recover {recovered_count} question_ids"
-                    )
+                clean_df.loc[null_qid_mask, "question_id"] = clean_df.loc[null_qid_mask, "custom_id"].apply(extract_qid_fallback)
 
-                    # Apply the fallback
-                    clean_df.loc[clean_df["question_id"].isna(), "question_id"] = (
-                        clean_df.loc[clean_df["question_id"].isna(), "custom_id"].apply(
-                            extract_qid_fallback
-                        )
-                    )
+            # Standardize type
+            clean_df["question_id"] = clean_df["question_id"].astype(str)
 
-        # Handle validity - try multiple approaches to preserve rows
+
+        # 2. Validity Coercion & Recovery
         if "validity" in clean_df.columns:
-            before_validity = len(clean_df)
-            original_validity = clean_df["validity"].copy()
-
-            # Apply boolean coercion
             clean_df["validity"] = clean_df["validity"].apply(self._coerce_bool)
-
-            # For rows where coercion failed, try alternative approaches
-            failed_coercion = clean_df["validity"].isna() & original_validity.notna()
-            if failed_coercion.sum() > 0:
-                print(
-                    f"RECOVERY: Attempting to recover {failed_coercion.sum()} validity values"
-                )
-
-                # Look at the raw text to extract validity
-                if "_raw_text" in clean_df.columns:
-
-                    def extract_validity_from_text(raw_text):
-                        if pd.isna(raw_text):
-                            return None
-                        text_lower = str(raw_text).lower()
-                        if "true" in text_lower and "false" not in text_lower:
-                            return True
-                        elif "false" in text_lower and "true" not in text_lower:
-                            return False
-                        return None
-
-                    recovered_validity = clean_df.loc[
-                        failed_coercion, "_raw_text"
-                    ].apply(extract_validity_from_text)
-                    recovery_count = recovered_validity.notna().sum()
-                    print(f"Recovered {recovery_count} validity values from raw text")
-
-                    # Apply recovered values
-                    clean_df.loc[
-                        failed_coercion & recovered_validity.notna(), "validity"
-                    ] = recovered_validity.dropna()
-
-            final_invalid = clean_df["validity"].isna().sum()
-            if final_invalid > 0:
-                print(
-                    f"WARNING: Still have {final_invalid} rows with invalid validity - these will be excluded from analysis"
-                )
-
-        # Ensure model_id is populated - use model_reported as fallback
-        if "model_reported" in clean_df.columns:
-            clean_df["model_id"] = clean_df["model_reported"]
-
-            # Apply standardization
-            mask_mini = clean_df["model_id"].str.startswith("gpt-4o-mini", na=False)
-            clean_df.loc[mask_mini, "model_id"] = "GPT4oMini"
-
-            # Handle regular GPT-4o (including versioned ones like gpt-4o-2024-08-06)
-            mask_4o = clean_df["model_id"].str.startswith(
-                "gpt-4o", na=False
-            ) & ~clean_df["model_id"].str.startswith("gpt-4o-mini", na=False)
-            clean_df.loc[mask_4o, "model_id"] = "GPT4o"
             
-            # Handle Gemma
-            mask_gemma = clean_df["model_id"].str.contains("gemma", na=False, case=False)
-            clean_df.loc[mask_gemma, "model_id"] = "Gemma" # Standardize
-
-        # Fill missing trait values from custom_id if possible
-        if "trait" in clean_df.columns:
-            null_trait_count = clean_df["trait"].isna().sum()
-            if null_trait_count > 0 and "custom_id" in clean_df.columns:
-                print(
-                    f"RECOVERY: Attempting to recover {null_trait_count} missing trait values"
-                )
-
-                def extract_trait_from_custom_id(custom_id):
-                    if pd.isna(custom_id):
-                        return None
-                    # Common trait names to look for
-                    traits = [
-                        "Functional_Relevance",
-                        "Visual_Clarity",
-                        "Technical_Quality",
-                        "Standard_Presentation",
-                        "Text-Image_Coherence",
-                        "Fair_Representation",
-                    ]
-                    custom_id_str = str(custom_id)
-                    for trait in traits:
-                        if trait.lower().replace("_", "").replace(
-                            "-", ""
-                        ) in custom_id_str.lower().replace("_", "").replace("-", ""):
-                            return trait
+            # Try to recover from raw text if validity is missing but we have text
+            missing_validity = clean_df["validity"].isna() & clean_df["_raw_text"].notna()
+            if missing_validity.sum() > 0:
+                print(f"RECOVERY: Attempting to recover {missing_validity.sum()} validity values from raw text")
+                def recover_validity(text):
+                    t = str(text).lower()
+                    if "true" in t and "false" not in t: return True
+                    if "false" in t and "true" not in t: return False
                     return None
+                
+                recovered = clean_df.loc[missing_validity, "_raw_text"].apply(recover_validity)
+                clean_df.loc[missing_validity, "validity"] = recovered
 
-                recovered_traits = clean_df.loc[
-                    clean_df["trait"].isna(), "custom_id"
-                ].apply(extract_trait_from_custom_id)
-                recovery_count = recovered_traits.notna().sum()
-                print(f"Recovered {recovery_count} trait values from custom_id")
-                clean_df.loc[
-                    clean_df["trait"].isna() & recovered_traits.notna(), "trait"
-                ] = recovered_traits.dropna()
+        # 3. Trait Recovery
+        if "trait" in clean_df.columns:
+             missing_trait = clean_df["trait"].isna() & clean_df["custom_id"].notna()
+             if missing_trait.sum() > 0:
+                 print(f"RECOVERY: Attempting to recover {missing_trait.sum()} traits from custom_id")
+                 traits_map = {
+                     "functional_relevance": "Functional Relevance",
+                     "visual_clarity": "Visual Clarity",
+                     "technical_quality": "Technical Quality", 
+                     "standard_presentation": "Standard Presentation",
+                     "text-image_coherence": "Text-Image Coherence",
+                     "fair_representation": "Fair Representation"
+                 }
+                 def recover_trait(cid):
+                     c_lower = str(cid).lower().replace("-", "_")
+                     for key, val in traits_map.items():
+                         if key in c_lower: return val
+                     return None
+                 clean_df.loc[missing_trait, "trait"] = clean_df.loc[missing_trait, "custom_id"].apply(recover_trait)
 
-        # Report final data quality but DON'T drop rows
-        required_cols = ["question_id", "model_id", "trait", "validity"]
-        for col in required_cols:
+        # 4. Model ID Standardization
+        if "model_id" in clean_df.columns:
+             # Fill from reported if missing
+             clean_df["model_id"] = clean_df["model_id"].fillna(clean_df.get("model_reported"))
+             
+             # Standardize common names
+             mask_mini = clean_df["model_id"].str.startswith("gpt-4o-mini", na=False)
+             clean_df.loc[mask_mini, "model_id"] = "GPT4oMini"
+             
+             mask_4o = clean_df["model_id"].str.startswith("gpt-4o", na=False) & ~mask_mini
+             clean_df.loc[mask_4o, "model_id"] = "GPT4o"
+
+
+        # 5. Final Filtering
+        required = ["question_id", "trait", "validity"]
+        for col in required:
             if col in clean_df.columns:
-                null_count = clean_df[col].isna().sum()
-                if null_count > 0:
-                    print(
-                        f"WARNING: {null_count}/{len(clean_df)} rows have missing {col}"
-                    )
-            else:
-                print(f"ERROR: Missing required column: {col}")
+                missing = clean_df[col].isna().sum()
+                if missing > 0:
+                    print(f"WARNING: {missing} rows missing '{col}'")
 
-        # Only remove rows that are completely unusable (all key fields missing)
-        unusable_mask = (
-            clean_df["question_id"].isna()
-            & clean_df["trait"].isna()
-            & clean_df["validity"].isna()
-        )
-        unusable_count = unusable_mask.sum()
+        # Remove unusable rows
+        mask = clean_df["validity"].notna()
+        clean_df = clean_df[mask]
 
-        if unusable_count > 0:
-            print(f"Removing {unusable_count} completely unusable rows")
-            clean_df = clean_df[~unusable_mask]
-
-        # Basic type normalization for non-null values
-        if "question_id" in clean_df.columns:
-            clean_df.loc[clean_df["question_id"].notna(), "question_id"] = clean_df.loc[
-                clean_df["question_id"].notna(), "question_id"
-            ].astype(str)
-
-        if len(clean_df) > 0 and "model_id" in clean_df.columns:
-            unique_models = sorted(
-                [str(x) for x in clean_df["model_id"].unique() if pd.notna(x)]
-            )
-            print(f"All model_ids after cleaning: {unique_models}")
-
-        print(
-            f"Final result: {len(df)} -> {len(clean_df)} rows ({len(df) - len(clean_df)} removed as completely unusable)"
-        )
-        print(f"Data completeness:")
-        for col in required_cols:
-            if col in clean_df.columns:
-                complete_pct = (1 - clean_df[col].isna().mean()) * 100
-                print(f"  {col}: {complete_pct:.1f}% complete")
-
+        print(f"Final clean count: {len(clean_df)}")
         return clean_df

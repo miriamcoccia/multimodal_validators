@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import asyncio
 import pandas as pd
 from pathlib import Path
@@ -25,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(level: str = "INFO"):
     """Configure logging for the application"""
+ 
     logging.basicConfig(
         level=getattr(logging, level.upper()),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -45,6 +45,7 @@ async def test_models_batch(
     model_ids: List[str],
     data: pd.DataFrame,
     orchestrator: Orchestrator,
+    mode: str, # <-- ADDED
 ) -> List[Dict[str, Any]]:
     """
     Collect all batch requests across models and questions.
@@ -54,20 +55,23 @@ async def test_models_batch(
 
     for model_id in model_ids:
         provider = get_provider_from_model_id(model_id=model_id)
-        print(f"\n📋 Collecting requests for {model_id} (Provider: {provider})...")
+        # UPDATED print statement
+        print(f"\n📋 Collecting requests for {model_id} (Provider: {provider}, Mode: {mode})...")
 
         for i, (_, row) in enumerate(data.iterrows()):
             question = ScienceQA.from_df_row(row)
 
-            requests, _ = await orchestrator.prepare_batch_requests(
-                question, provider, model_id
-            )
+            if mode in ("single", "both"):
+                single_reqs, _ = await orchestrator.prepare_batch_requests(
+                    question, provider, model_id
+                )
+                all_requests.extend(single_reqs)
 
-            for request in requests:
-                request["_provider"] = provider
-
-            all_requests.extend(requests)
-
+            if mode in ("combined", "both"):
+                combined_reqs, _ = await orchestrator.prepare_combined_batch_requests(
+                    question, provider, model_id
+                )
+                all_requests.extend(combined_reqs)
             if (i + 1) % 5 == 0:
                 print(f"  📝 Processed {i + 1}/{total_questions} questions")
 
@@ -94,13 +98,12 @@ async def monitor_batch_progress(
                 if error_file_id:
                     _log.warning("⚠️ Batch has errors, checking error file...")
                     try:
-                        # TODO: solve this "client" problem
                         error_content = batch_service.client.files.content(
                             error_file_id
                         )
                         text_preview = getattr(error_content, "text", None)
                         if text_preview:
-                            _log.error(f"First error: {text_preview[:500]}...")
+                            _log.error(f"First error: {text_preview[:1000]}...")
                     except Exception as e:
                         _log.error(f"Could not retrieve error file: {e}")
 
@@ -121,12 +124,40 @@ async def monitor_batch_progress(
             await asyncio.sleep(check_interval)
 
 
+
 async def main(args):
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
 
+    trait_def = ImgTraitDefinition(Path(settings["paths"]["trait_definitions_json"]))
+    trait_list = list(trait_def.traits.keys())
+    orchestrator = Orchestrator(
+        trait_names=trait_list,
+    )
     # --- Ad-hoc Batch Commands ---
     # These commands operate on a single provider, specified by the --provider flag.
+    # --- Check for batch error retrieval ---
+    if args.batch_error:
+        if args.provider != "openai":
+            print("❌ Only OpenAI batches support error file retrieval currently.")
+            return
+
+        batch_service: OpenAIBatchService = orchestrator.openai_batch_service
+        status = batch_service.get_batch_status(args.batch_error)
+        error_file_id = status.get("error_file_id")
+
+        if error_file_id:
+            try:
+                import openai
+                content = openai.File.download(error_file_id)
+                text = content.decode("utf-8")
+                print(f"\n⚠️ Error file for batch {args.batch_error}:\n")
+                print(text[:2000])  # show first 2k chars
+            except Exception as e:
+                print(f"❌ Failed to download error file: {e}")
+        else:
+            print(f"✅ Batch {args.batch_error} has no error file.")
+        return  # exit after handling
     if (
         args.list_batches
         or args.cancel_batch
@@ -215,32 +246,24 @@ async def main(args):
                 args.download_batch, str(output_path)
             )
             if success:
-                print(f"📥 Results downloaded to: {output_path}")
+                (f"📥 Results downloaded to: {output_path}")
 
         return  # Exit after running the ad-hoc command
 
     # --- Main Evaluation Logic ---
 
-    # Load Configuration & Data (no changes here)
-    trait_def = ImgTraitDefinition(Path(settings["paths"]["trait_definitions_json"]))
-    trait_list = list(trait_def.traits.keys())
-    orig_trait_def = OriginalTraitDefinition(
-        Path(settings["paths"]["orig_trait_definitions_json"])
-    )
-    orig_trait_list = list(orig_trait_def.traits.keys())
     test_df = pd.read_csv(Path(settings["paths"]["input_data_csv"])).head(
         args.num_questions
     )
-    model_ids_to_test = args.models.split(",") if args.models else ["GPT4o"]
+    model_ids_to_test = args.models.split(",") if args.models else ["GPT5Nano"]
 
-    # Create the Orchestrator once. It now manages all its own internal services.
+    # Create the Orchestrator once.
     orchestrator = Orchestrator(
         trait_names=trait_list,
-        checkpoint_file=settings["paths"]["checkpoint_json"],
     )
 
     if args.batch:
-        print("\n🚀 BATCH MODE: Collecting requests...")
+        print(f"\n🚀 BATCH MODE: Collecting requests (Mode: {args.mode})...")
 
         # If a pre-built JSONL file was provided, skip generating requests
         if args.batch_file:
@@ -272,41 +295,70 @@ async def main(args):
             return  # done
 
         # --- Otherwise: generate requests as before ---
-        all_requests = await test_models_batch(model_ids_to_test, test_df, orchestrator)
 
-        openai_requests = []
-        nebius_requests = []
+        all_requests = await test_models_batch(
+            model_ids_to_test, test_df, orchestrator,
+            mode=args.trait_mode
+        )
 
-        for request in all_requests:
-            provider = request.pop("_provider", "openai")
+        # Group by provider, strategy, and model so each model gets its own JSONL.
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for r in all_requests:
+            provider = r.get("_provider")
+            strategy = r.get("_strategy", "single")
+            model_id = r.get("_model_id", "unknown")
+            if provider is None:
+                continue
+            key = (provider, strategy, model_id)
+            groups.setdefault(key, []).append(r)
+
+        # Helper to drop internal metadata keys (those starting with "_")
+        def _clean(reqs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [{k: v for k, v in r.items() if not k.startswith("_")} for r in reqs]
+
+        base_path = Path(settings["paths"]["batch_request_file"])
+
+        for (provider, strategy, model_id), reqs in groups.items():
+            cleaned = _clean(reqs)
+            safe_model = "".join(c if c.isalnum() else "_" for c in model_id)
+            suffix_provider = "openai" if provider == "openai" else "nebius"
+            output_file = base_path.with_name(
+                f"{base_path.stem}_{suffix_provider}_{safe_model}_{strategy}{base_path.suffix}"
+            )
+
+            # Choose correct batch service
             if provider == "openai":
-                openai_requests.append(request)
+                orchestrator.openai_batch_service.write_jsonl_file(cleaned, str(output_file))
             elif provider == "nebius":
-                nebius_requests.append(request)
+                orchestrator.nebius_batch_service.write_jsonl_file(cleaned, str(output_file))
+            else:
+                continue
 
-        # If we have OpenAI requests, write or submit
-        if openai_requests:
-            # Default destination path from config (unchanged)
-            openai_file = Path(settings["paths"]["batch_request_file"])
-            orchestrator.openai_batch_service.write_jsonl_file(openai_requests, str(openai_file))
-            print(f"💾 Saved {len(openai_requests)} OpenAI requests to: {openai_file}")
+            print(f"💾 Saved {len(cleaned)} {provider.upper()} {strategy} requests for {model_id} to: {output_file}")
 
-            if args.submit_batch:
-                batch_id = orchestrator.openai_batch_service.submit_batch(str(openai_file), args.batch_name)
+            # Optionally submit this file depending on strategy / trait_mode
+            should_submit = args.submit_batch and (
+                args.trait_mode == strategy or args.trait_mode == "both"
+            )
+            if not should_submit:
+                continue
+
+            if provider == "openai":
+                batch_id = orchestrator.openai_batch_service.submit_batch(
+                    str(output_file), args.batch_name
+                )
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(batch_id, orchestrator.openai_batch_service, args.check_interval)
-
-        # Nebius requests: write or submit
-        if nebius_requests:
-            base_path = Path(settings["paths"]["batch_request_file"])
-            nebius_file = base_path.with_name(f"{base_path.stem}_nebius{base_path.suffix}")
-            orchestrator.nebius_batch_service.write_jsonl_file(nebius_requests, str(nebius_file))
-            print(f"💾 Saved {len(nebius_requests)} Nebius requests to: {nebius_file}")
-
-            if args.submit_batch:
-                batch_id = orchestrator.nebius_batch_service.submit_batch(str(nebius_file), args.batch_name)
+                    await monitor_batch_progress(
+                        batch_id, orchestrator.openai_batch_service, args.check_interval
+                    )
+            elif provider == "nebius":
+                batch_id = orchestrator.nebius_batch_service.submit_batch(
+                    str(output_file), args.batch_name
+                )
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(batch_id, orchestrator.nebius_batch_service, args.check_interval)
+                    await monitor_batch_progress(
+                        batch_id, orchestrator.nebius_batch_service, args.check_interval
+                    )
 
 
 if __name__ == "__main__":
@@ -327,6 +379,13 @@ if __name__ == "__main__":
         help="Path to an existing JSONL batch file to submit (skip writing new JSONL).",
     )
 
+    parser.add_argument(
+        "-tm",
+        "--trait-mode",
+        choices=["single", "combined", "both"],
+        default="both",
+        help="How to build batch requests: per-trait agents, combined traits, or both. Default: both."
+    )
 
     parser.add_argument(
         "-p",
@@ -409,5 +468,20 @@ if __name__ == "__main__":
         default=300,
         help="Batch monitoring interval in seconds (default: 300)",
     )
+    
+    parser.add_argument(
+        "--batch-error",
+        type=str,
+        help="Retrieve and display error file for failed batch by ID",
+    )
+    # --- SINGLE VS MULTIPLE TRAIT COMPARISON ---  #TODO: update this
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="singular",
+        choices=["singular", "combined"],
+        help="Evaluation mode: 'singular' (one request per trait) or 'combined' (one request for all traits)."
+    )
+    
     args = parser.parse_args()
     asyncio.run(main(args))

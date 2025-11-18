@@ -11,7 +11,7 @@ image_base_dir = "data/ScienceQA_images/test"
 # Path to the main input data CSV
 input_data_csv = "data/ScienceQA_test_mc_images.csv"
 # Directory to save output results
-results_dir = "data/gpt-4o-mini-no-examples/"
+results_dir = "data/comparison_results/"
 # Path to the JSON file containing trait definitions and examples
 trait_definitions_json = "data/prompt_fillers.json"
 # Path to the JSON file containing original trait definitions and examples
@@ -93,5 +93,6 @@ ensemble_combinations = [["L_MistralSmall3124B","L_MistralSmall3224B"]]
 #  MODEL PARAMETERS
 # =============================================================================
 [parameters.openai]
-max_tokens = 256
+max_tokens = 3000
+
 image_detail = "auto" # Can be "low", "high", or "auto"

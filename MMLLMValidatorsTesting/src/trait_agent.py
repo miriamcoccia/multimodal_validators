@@ -152,7 +152,11 @@ class TraitAgent:
                         },
                     },
                 }
-                
+
+                if model_id.startswith("GPT5"):
+                    payload["reasoning"] = {"effort": "low"}
+                    payload["text"]["verbosity"] = "low"
+                    
                 # GPT5 does not take temperature or top_p parameters in the payload
                 if not model_id.startswith("GPT5"):
                     payload["temperature"] = 0

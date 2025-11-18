@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Script to normalize batch JSONL results to raw and clean CSV files.
 Uses ResultsHandler to parse one or more JSONL formats.

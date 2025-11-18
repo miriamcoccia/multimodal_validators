@@ -1,205 +1,382 @@
 #!/usr/bin/env python3
 import asyncio
-import logging # Import logging at the top
+import logging
 from pathlib import Path
-from sys import prefix
 import pandas as pd
 from datetime import datetime
-import json # Import json for potential debugging if needed
+import json
+import argparse
+from typing import Optional, List, Dict, Any
 
-from src.config import settings
+from src.config import settings, PROJECT_ROOT  # ✅ Added PROJECT_ROOT
 from src.orchestrator import Orchestrator
 from src.img_traits_def import ImgTraitDefinition
 from src.science_qa import ScienceQA
+from src.llm_service.providers.basic_batch import BaseBatchService
+from src.llm_service.service import (
+    OpenAIBatchService,
+    NebiusBatchService,
+)
 
 # ---------- Setup logging at the MODULE LEVEL ----------
-# Configure logging basic settings first
 logging.basicConfig(
-    level=logging.INFO, # Default level, can be overridden later if needed
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
     datefmt="%H:%M:%S",
 )
-# Create the named logger for this module
 logger = logging.getLogger("run_all_models")
 
 
-# ---------- PROVIDER DETECTION ----------
+# ---------- PROVIDER DETECTION (from main.py) ----------
 def get_provider_from_model_id(model_id: str) -> str:
-    """Determines provider based on model ID pattern."""
-    mid = model_id.upper()
-    if mid.startswith("GPT"):     # e.g., GPT4o, GPT4oMini
+    """Determines the provider based on the model ID prefix"""
+    if model_id.upper().startswith("GPT"):
         return "openai"
-    elif mid.startswith("L_"):    # e.g., L_Gemma34B, L_Qwen25VL72B
+    elif model_id.upper().startswith("L_"):
         return "nebius"
-    # Add more prefixes if needed
-    # --- FIXED: logger is now accessible here ---
-    logger.warning(f"⚠️ Could not determine provider for model '{model_id}', assuming 'unknown'.")
-    return "unknown"
+    raise ValueError(f"Could not determine provider for model {model_id}")
 
-# ---------- CLEANING UTIL ----------
-def clean_requests(requests: list) -> list:
-    """Remove internal metadata before writing to JSONL."""
-    return [{k: v for k, v in r.items() if not k.startswith("_")} for r in requests]
+
+# ---------- BATCH HELPERS (from main.py) ----------
+async def test_models_batch(
+    model_ids: List[str],
+    data: pd.DataFrame,
+    orchestrator: Orchestrator,
+    mode: str,  # "single", "combined", or "both"
+) -> List[Dict[str, Any]]:
+    """
+    Collect all batch requests across models and questions based on the mode.
+    """
+    all_requests = []
+    total_questions = len(data)
+
+    for model_id in model_ids:
+        try:
+            provider = get_provider_from_model_id(model_id=model_id)
+        except ValueError as e:
+            logger.error(f"❌ {e}. Skipping model {model_id}.")
+            continue
+
+        logger.info(
+            f"\n📋 Collecting requests for {model_id} (Provider: {provider}, Mode: {mode})..."
+        )
+
+        for i, (_, row) in enumerate(data.iterrows(), 1):
+            question = ScienceQA.from_df_row(row)
+
+            try:
+                if mode in ("single", "both"):
+                    # Assumes prepare_batch_requests adds internal keys:
+                    # _provider, _model_id, _strategy="single"
+                    single_reqs, _ = await orchestrator.prepare_batch_requests(
+                        question, provider, model_id
+                    )
+                    all_requests.extend(single_reqs)
+
+                if mode in ("combined", "both"):
+                    # Assumes prepare_combined_batch_requests adds internal keys:
+                    # _provider, _model_id, _strategy="combined"
+                    combined_reqs, _ = (
+                        await orchestrator.prepare_combined_batch_requests(
+                            question, provider, model_id
+                        )
+                    )
+                    all_requests.extend(combined_reqs)
+
+            except Exception as e:
+                qid = row.get("question_id", "Unknown")
+                logger.error(
+                    f"    Failed to prepare request for QID {qid}, Model {model_id}: {e}"
+                )
+
+            if (i + 1) % 10 == 0 or (i + 1) == total_questions:
+                logger.info(f"    Processed {i + 1}/{total_questions} questions")
+
+    return all_requests
+
+
+async def monitor_batch_progress(
+    batch_id: str,
+    batch_service: BaseBatchService,
+    check_interval: int,
+    # ✅ Added metadata for download path
+    model_id: str,
+    provider: str,
+    strategy: str,
+):
+    """Monitor batch progress and download results on completion."""
+    _log = logging.getLogger(__name__)
+    _log.info(f"👀 Monitoring batch {batch_id}...")
+
+    while True:
+        try:
+            status = batch_service.get_batch_status(batch_id)
+            batch_status = status.get("status", "unknown")
+
+            if batch_status == "completed":
+                _log.info(f"🎉 Batch {batch_id} completed!")
+
+                # --- ✅ NEW DOWNLOAD LOGIC ---
+                output_file_id = status.get("output_file_id")
+                if not output_file_id:
+                    _log.error(
+                        f"❌ Batch {batch_id} completed but has no output_file_id. Cannot download."
+                    )
+                else:
+                    # Construct the path: data/batch_results/<provider>/<model_id>/<strategy>/
+                    safe_model = "".join(
+                        c if c.isalnum() else "_" for c in model_id
+                    )
+                    output_dir = (
+                        PROJECT_ROOT
+                        / "data"
+                        / "batch_results"
+                        / provider
+                        / safe_model
+                        / strategy
+                    )
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Use a unique filename
+                    output_filename = f"results_{batch_id}_{output_file_id}.jsonl"
+                    output_path = output_dir / output_filename
+
+                    _log.info(
+                        f"📥 Downloading results for {batch_id} to {output_path}..."
+                    )
+                    try:
+                        success = batch_service.download_batch_results(
+                            batch_id, str(output_path)
+                        )
+                        if success:
+                            _log.info(f"✅ Download complete: {output_path.name}")
+                        else:
+                            _log.warning(f"⚠️ Download command failed for {batch_id}.")
+                    except Exception as e:
+                        _log.error(f"❌ Download failed for {batch_id}: {e}")
+                # --- END NEW DOWNLOAD LOGIC ---
+
+                error_file_id = status.get("error_file_id")
+                if error_file_id:
+                    _log.warning("⚠️ Batch has errors, checking error file...")
+                    try:
+                        error_content = batch_service.client.files.content(
+                            error_file_id
+                        )
+                        text_preview = getattr(error_content, "text", None)
+                        if text_preview:
+                            _log.error(f"First error: {text_preview[:1000]}...")
+                    except Exception as e:
+                        _log.error(f"Could not retrieve error file: {e}")
+                return True
+
+            elif batch_status == "failed":
+                _log.error(f"❌ Batch {batch_id} failed!")
+                return False
+
+            elif batch_status == "in_progress":
+                counts = status.get("request_counts", {})
+                _log.info(f"⏳ Progress: {counts}")
+
+            await asyncio.sleep(check_interval)
+
+        except Exception as e:
+            _log.error(f"Error checking batch: {e}")
+            await asyncio.sleep(check_interval)
 
 
 # ---------- MAIN RUNNER ----------
-async def run_all_models(num_questions: int = 100):
+async def run_all_models(args):
     """
-    Prepare **one batch JSONL file per model** defined in config (OpenAI + Nebius).
+    Prepare and optionally submit batch JSONL files for ALL models
+    defined in config, respecting the --trait-mode.
     """
-    # Logging is already configured at module level
-    logger.info("🚀 Starting batch preparation - **one file per model**...")
+    logger.info(
+        f"🚀 Starting batch preparation for ALL models (Mode: {args.trait_mode})..."
+    )
 
-    # --- Load models from config ---
+    # --- Load ALL models from config ---
     all_models_dict = settings.get("all_models", {})
     if not all_models_dict:
-        # Use logger defined at module level
         logger.error("❌ No models found in settings['all_models']!")
         raise RuntimeError("No models found in settings['all_models']!")
 
-    model_ids_to_process = list(all_models_dict.keys())
-    logger.info(f"🧠 Found {len(model_ids_to_process)} total models to process:")
-    for m_alias in model_ids_to_process:
+    model_ids_to_test = list(all_models_dict.keys())
+    logger.info(f"🧠 Found {len(model_ids_to_test)} total models to process:")
+    for m_alias in model_ids_to_test:
         try:
             provider = get_provider_from_model_id(m_alias)
             actual_name = all_models_dict[m_alias]
-            logger.info(f"    - {m_alias} (Provider: {provider}, API Name: {actual_name})")
-        except ValueError as e:
-             logger.error(f"    - Error determining provider for {m_alias}: {e}")
-        except KeyError:
-             logger.error(f"    - Error: Model alias '{m_alias}' found in list but not in 'all_models' dict.")
-
+            logger.info(
+                f"    - {m_alias} (Provider: {provider}, API Name: {actual_name})"
+            )
+        except Exception as e:
+            logger.warning(f"    - Could not determine provider for {m_alias}: {e}")
 
     # --- Load dataset ---
     csv_path = Path(settings["paths"]["input_data_csv"])
     if not csv_path.exists():
-         logger.error(f"❌ Input data CSV not found at: {csv_path.resolve()}")
-         raise FileNotFoundError(f"Input data CSV not found at: {csv_path.resolve()}")
+        logger.error(f"❌ Input data CSV not found at: {csv_path.resolve()}")
+        raise FileNotFoundError(f"Input data CSV not found at: {csv_path.resolve()}")
     try:
         df = pd.read_csv(csv_path)
-        if num_questions > 0 and num_questions < len(df):
-            df = df.head(num_questions)
-            logger.info(f"📚 Loaded {len(df)} questions (limited by num_questions={num_questions}) from: {csv_path.resolve()}")
+        if args.num_questions > 0 and args.num_questions < len(df):
+            df = df.head(args.num_questions)
+            logger.info(
+                f"📚 Loaded {len(df)} questions (limited by --num-questions={args.num_questions}) from: {csv_path.resolve()}"
+            )
         else:
-             logger.info(f"📚 Loaded all {len(df)} questions from: {csv_path.resolve()}")
+            logger.info(
+                f"📚 Loaded all {len(df)} questions from: {csv_path.resolve()}"
+            )
     except Exception as e:
         logger.error(f"❌ Failed to load or process CSV '{csv_path}': {e}")
         return
 
-
     # --- Initialize orchestrator and traits ---
     try:
         trait_def_path = Path(settings["paths"]["trait_definitions_json"])
-        if not trait_def_path.exists():
-            logger.error(f"Trait definitions JSON not found: {trait_def_path.resolve()}")
-            raise FileNotFoundError(f"Trait definitions JSON not found: {trait_def_path.resolve()}")
         trait_def = ImgTraitDefinition(trait_def_path)
-        if not trait_def.traits:
-             logger.error("Trait definitions loaded but resulted in an empty traits dictionary.")
-             raise ValueError("Trait definitions loaded but resulted in an empty traits dictionary.")
-        trait_names = list(trait_def.traits.keys())
-        logger.info(f"🧬 Loaded {len(trait_names)} traits: {', '.join(trait_names)}")
+        trait_list = list(trait_def.traits.keys())
+        if not trait_list:
+            raise ValueError("Trait definitions loaded but resulted in an empty list.")
+        logger.info(f"🧬 Loaded {len(trait_list)} traits.")
     except Exception as e:
         logger.error(f"❌ Failed to initialize trait definitions: {e}")
         return
 
-    try:
-        checkpoint_file = settings["paths"].get("checkpoint_json")
-        orchestrator = Orchestrator(
-            trait_names=trait_names,
-            checkpoint_file=checkpoint_file,
-        )
-        logger.info("✅ Orchestrator initialized.")
-    except Exception as e:
-         logger.error(f"❌ Failed to initialize Orchestrator: {e}")
-         return
+    # Initialize Orchestrator (following main.py, no checkpoint file)
+    orchestrator = Orchestrator(
+        trait_names=trait_list,
+    )
+    logger.info("✅ Orchestrator initialized.")
 
+    # --- Start request generation ---
+    start_time_all = datetime.now()
+    logger.info(
+        f"🕓 Beginning request generation at {start_time_all.strftime('%Y-%m-%d %H:%M:%S')}..."
+    )
 
-    # --- Start processing PER MODEL ---
-    total_models = len(model_ids_to_process)
-    total_questions = len(df)
+    all_requests = await test_models_batch(
+        model_ids_to_test, df, orchestrator, mode=args.trait_mode
+    )
+
+    elapsed_gen = (datetime.now() - start_time_all).total_seconds()
+    logger.info(
+        f"📦 Total collected {len(all_requests)} requests in {elapsed_gen:.2f}s."
+    )
+
+    if not all_requests:
+        logger.warning("No requests were generated. Exiting.")
+        return
+
+    # --- Group requests by (provider, strategy, model) ---
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for r in all_requests:
+        provider = r.get("_provider")
+        strategy = r.get("_strategy")  # e.g., "single" or "combined"
+        model_id = r.get("_model_id")  # e.g., "GPT5Nano"
+
+        if not all([provider, strategy, model_id]):
+            logger.warning(
+                f"Skipping request with missing metadata: {r.get('custom_id')}"
+            )
+            continue
+        key = (provider, strategy, model_id)
+        groups.setdefault(key, []).append(r)
+
+    logger.info(f"📊 Found {len(groups)} unique (provider, strategy, model) groups.")
+
+    # --- Write files and optionally submit ---
+
+    # Helper to drop internal metadata keys
+    def _clean(reqs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in reqs]
+
+    base_path = Path(settings["paths"]["batch_request_file"])
+    base_path.parent.mkdir(parents=True, exist_ok=True)
     files_created = []
 
-    start_time_all = datetime.now()
-    logger.info(f"🕓 Beginning request generation at {start_time_all.strftime('%Y-%m-%d %H:%M:%S')}...\n")
+    # Create a list of tasks to run concurrently (e.g., monitoring)
+    monitor_tasks = []
 
-    for model_idx, model_id_alias in enumerate(model_ids_to_process, 1):
-        model_start_time = datetime.now()
-        logger.info(f"--- Processing Model {model_idx}/{total_models}: {model_id_alias} ---")
+    for (provider, strategy, model_id), reqs in groups.items():
+        cleaned_reqs = _clean(reqs)
+        safe_model = "".join(c if c.isalnum() else "_" for c in model_id)
+        suffix_provider = "openai" if provider == "openai" else "nebius"
 
-        requests_for_this_model = []
+        # Generate a timestamp for this specific file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        output_file = base_path.with_name(
+            f"{base_path.stem}_{suffix_provider}_{safe_model}_{strategy}_{timestamp}{base_path.suffix}"
+        )
+
+        batch_service = None
         try:
-            provider = get_provider_from_model_id(model_id_alias)
-            if provider == "openai" and not hasattr(orchestrator, 'openai_batch_service'):
-                 raise AttributeError("Orchestrator missing 'openai_batch_service'.")
-            if provider == "nebius" and not hasattr(orchestrator, 'nebius_batch_service'):
-                 raise AttributeError("Orchestrator missing 'nebius_batch_service'.")
-            if provider == "unknown":
-                logger.error(f"Skipping model {model_id_alias} due to unknown provider.")
+            if provider == "openai":
+                batch_service = orchestrator.openai_batch_service
+            elif provider == "nebius":
+                batch_service = orchestrator.nebius_batch_service
+            else:
+                logger.error(f"Unknown provider '{provider}' for group. Skipping.")
                 continue
 
-        except (ValueError, AttributeError) as e:
-            logger.error(f"❌ Error setting up for model {model_id_alias}: {e}. Skipping model.")
+            batch_service.write_jsonl_file(cleaned_reqs, str(output_file))
+            logger.info(
+                f"💾 Saved {len(cleaned_reqs)} {provider.upper()} {strategy} requests for {model_id} to: {output_file.name}"
+            )
+            files_created.append(output_file)
+
+        except Exception as e:
+            logger.error(f"❌ Failed to write file {output_file.name}: {e}")
             continue
 
-        processed_questions_for_model = 0
-        for i, (_, row) in enumerate(df.iterrows(), 1):
-            try:
-                question = ScienceQA.from_df_row(row)
-                requests, image_file_ids_or_none = await orchestrator.prepare_batch_requests(
-                    question, provider, model_id_alias
+        # --- Submission Logic (from main.py) ---
+        if not args.submit_batch:
+            continue
+
+        if not (args.trait_mode == strategy or args.trait_mode == "both"):
+            logger.info(
+                f"    (Skipping submission for {strategy} mode as --trait-mode={args.trait_mode})"
+            )
+            continue
+
+        logger.info(f"📤 Submitting {output_file.name} for {model_id}...")
+        try:
+            batch_id = batch_service.submit_batch(str(output_file), args.batch_name)
+            if batch_id and args.monitor:
+                logger.info(f"    Submitted batch ID: {batch_id}. Monitoring...")
+                # ✅ Schedule monitoring as a concurrent task
+                task = asyncio.create_task(
+                    monitor_batch_progress(
+                        batch_id,
+                        batch_service,
+                        args.check_interval,
+                        model_id=model_id,
+                        provider=provider,
+                        strategy=strategy,
+                    )
                 )
-                requests_for_this_model.extend(requests)
-                processed_questions_for_model += 1
+                monitor_tasks.append(task)
+            elif batch_id:
+                logger.info(f"    Submitted batch ID: {batch_id}. (Not monitoring)")
+            else:
+                logger.error(f"    Batch submission failed for {output_file.name}.")
 
-                if i % 20 == 0 or i == total_questions:
-                    elapsed_model = (datetime.now() - model_start_time).total_seconds()
-                    logger.info(f"    Processed {i}/{total_questions} questions for {model_id_alias} ({len(requests_for_this_model)} requests total) [{elapsed_model:.1f}s]")
+        except Exception as e:
+            logger.error(f"    ❌ Submission failed for {output_file.name}: {e}")
 
-            except Exception as e:
-                logger.error(f"    ❌ Error processing QID {row.get('question_id', 'N/A')} for model {model_id_alias}: {e}")
-
-        model_end_time = datetime.now()
-        model_duration = (model_end_time - model_start_time).total_seconds()
-        logger.info(f"✅ Finished model {model_id_alias}. Generated {len(requests_for_this_model)} requests in {model_duration:.2f} seconds.")
-
-        if requests_for_this_model:
-            cleaned_requests = clean_requests(requests_for_this_model)
-            base_path = Path(settings["paths"]["batch_request_file"])
-            timestamp = model_end_time.strftime("%Y%m%d_%H%M%S")
-            safe_model_alias = "".join(c if c.isalnum() else "_" for c in model_id_alias)
-            output_filename = f"{base_path.stem}_{safe_model_alias}_{timestamp}{base_path.suffix}"
-            # Ensure the output directory exists
-            output_dir = base_path.parent
-            output_dir.mkdir(parents=True, exist_ok=True) # Create dir if it doesn't exist
-            output_path = output_dir / output_filename
-
-            try:
-                batch_service = None
-                if provider == "openai":
-                    batch_service = orchestrator.openai_batch_service
-                elif provider == "nebius":
-                    batch_service = orchestrator.nebius_batch_service
-
-                if batch_service:
-                    batch_service.write_jsonl_file(cleaned_requests, str(output_path))
-                    logger.info(f"💾 Batch file for {model_id_alias} saved -> {output_path.resolve()}")
-                    files_created.append(output_path.resolve())
-                else:
-                     logger.error(f"Could not find batch service for provider '{provider}' to write file.")
-
-            except Exception as e:
-                logger.error(f"❌ Failed to write batch file for model {model_id_alias} to {output_path}: {e}")
-        else:
-             logger.warning(f"⚠️ No requests generated for model {model_id_alias}, skipping file write.")
-
-        logger.info("-" * (len(f"--- Processing Model {model_idx}/{total_models}: {model_id_alias} ---")) + "\n")
-
+    # --- Wait for all monitoring tasks to complete ---
+    if monitor_tasks:
+        logger.info(f"Waiting for {len(monitor_tasks)} monitoring task(s) to complete...")
+        await asyncio.gather(*monitor_tasks)
+        logger.info("All monitoring tasks finished.")
 
     # --- Summary after all models ---
     end_time_all = datetime.now()
     total_duration_minutes = (end_time_all - start_time_all).total_seconds() / 60
-    logger.info("="*50)
+    logger.info("=" * 50)
     logger.info(f"🎉 All models processed in {total_duration_minutes:.2f} minutes.")
     logger.info(f"📦 Generated {len(files_created)} batch file(s):")
     if files_created:
@@ -207,72 +384,74 @@ async def run_all_models(num_questions: int = 100):
             logger.info(f"   -> {f_path.name}")
     else:
         logger.info("   (No files were generated)")
-
-    logger.info("\n📤 To submit batches (example for one file):")
-    if files_created:
-         example_path = files_created[0]
-         # Infer provider from filename part (assuming format like ..._ModelAlias_timestamp.suffix)
-         try:
-            stem = example_path.stem
-            prefix = "batch_request_file_"
-            suffix_start_index = -1
-            parts = stem.split("_")
-            # looking backwards for time and date
-            if len(parts) >= 3 and len(parts[-1]) == 6 and parts[-1].isdigit() and \
-                len(parts[-2]) == 8 and parts[-2].isdigit():
-                model_alias_in_filename = "_".join(parts[3:-2])
-            else:
-                model_alias_in_filename = "unknown_alias"
-                logger.warning(f"Could not reliably parse filename pattern '{example_path.name}' for example command.")
-
-            if model_alias_in_filename != "unknown_alias":
-                example_provider = get_provider_from_model_id(model_alias_in_filename)
-                logger.info(f"   python src/main.py --provider {example_provider} --batch-file \"{example_path.resolve()}\" --submit-batch --monitor")
-            else:
-                # If alias extraction failed, show generic command
-                 logger.info("   python src/main.py --provider [openai|nebius] --batch-file \"<YOUR_FILE_PATH>\" --submit-batch --monitor")
-
-         except Exception as e: # Catch any potential errors during parsing
-             logger.error(f"Error parsing filename '{example_path.name}' to generate example command: {e}")
-             logger.info("uv run python -m src.main --provider [openai|nebius] --batch-file \"<YOUR_FILE_PATH>\" --submit-batch --monitor")
-    else: # If no files created, still show generic command
-        logger.info("uv run python -m src.main --provider [openai|nebius] --batch-file \"<YOUR_FILE_PATH>\" --submit-batch --monitor")
-
     logger.info("\n✨ Done!")
 
 
 # ---------- ENTRY POINT ----------
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Generate batch request files, one per model.")
-    parser.add_argument(
-        "-n", "--num-questions",
-        type=int,
-        default=100,
-        help="Number of questions to process (0 for all). Default: 100"
+    parser = argparse.ArgumentParser(
+        description="Generate and submit batch request files for ALL configured models."
     )
-    # Add log level argument
+
+    # --- Args from run_all_models.py ---
+    parser.add_argument(
+        "-n",
+        "--num-questions",
+        type=int,
+        default=1,  # Reduced default for safety
+        help="Number of questions to process (0 for all). Default: 10",
+    )
     parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the logging level (default: INFO)."
+        help="Set the logging level (default: INFO).",
     )
+
+    # --- Args from main.py ---
+    parser.add_argument(
+        "-tm",
+        "--trait-mode",
+        choices=["single", "combined", "both"],
+        default="both",
+        help="How to build batch requests: per-trait, combined, or both. Default: both.",
+    )
+    parser.add_argument(
+        "--batch-name", type=str, help="Optional custom name for batch identification"
+    )
+    parser.add_argument(
+        "--submit-batch",
+        action="store_true",
+        help="Actually submit the generated batch files to the API.",
+    )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Automatically monitor batch after submission (requires --submit-batch).",
+    )
+    parser.add_argument(
+        "--check-interval",
+        type=int,
+        default=300,
+        help="Batch monitoring interval in seconds (default: 300).",
+    )
+
     args = parser.parse_args()
 
     # --- Set logging level based on argument ---
     log_level_numeric = getattr(logging, args.log_level.upper(), logging.INFO)
-    logger.setLevel(log_level_numeric) # Set level for our named logger
-    # Optionally set level for root logger if other modules log too
-    logging.getLogger().setLevel(log_level_numeric)
+    logger.setLevel(log_level_numeric)
+    logging.getLogger().setLevel(log_level_numeric)  # Set root logger level
     logger.info(f"Logging level set to {args.log_level.upper()}")
 
+    if args.monitor and not args.submit_batch:
+        logger.warning("--monitor flag ignored as --submit-batch was not specified.")
 
     try:
-        asyncio.run(run_all_models(num_questions=args.num_questions))
+        asyncio.run(run_all_models(args))
     except (RuntimeError, FileNotFoundError, ValueError, Exception) as e:
-        # --- FIXED: logger is now accessible here ---
-        logger.error(f"💥 An error occurred during execution: {e}", exc_info=True) # Add traceback
+        logger.error(f"💥 An unhandled error occurred: {e}", exc_info=True)
         import sys
-        sys.exit(1) # Exit with error code
+
+        sys.exit(1)

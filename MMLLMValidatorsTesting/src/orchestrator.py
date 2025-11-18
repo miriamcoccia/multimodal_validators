@@ -4,6 +4,7 @@ import logging
 from src.trait_agent import TraitAgent
 from src.llm_service.service import OpenAIBatchService, NebiusBatchService
 from src.science_qa import ScienceQA
+from src.combined_traits_builder import CombinedTraitsBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +19,7 @@ class Orchestrator:
 
     def __init__(
         self,
-        trait_names: List[str],
-        checkpoint_file: Optional[str] = None,
+        trait_names: List[str]
     ):
         logger.info("🎶 Initializing Sequential Orchestrator...")
 
@@ -27,8 +27,10 @@ class Orchestrator:
         self.nebius_batch_service = NebiusBatchService()
 
         # self.all_agents = [TraitAgent(name) for name in trait_names]  ALL TRAITS
-        self.all_agents = [TraitAgent(name) for name in trait_names if name=="Text-Image Coherence"]  # JUST TARGET TRAIT WITH NEW PROMPT
-        self.checkpoint_file = checkpoint_file
+        self.all_agents = [TraitAgent(name) for name in trait_names]  
+
+        # combined builder to check all traits at once for each question
+        self.combined_builder = CombinedTraitsBuilder(trait_list=trait_names)
 
         logger.info(f"✅ Orchestrator created with {len(self.all_agents)} agents.")
 
@@ -73,6 +75,8 @@ class Orchestrator:
 
                 if request is not None:
                     request["_provider"] = provider
+                    request["_strategy"] = "single"
+                    request["_model_id"] = model_id
                     requests.append(request)
                 else:
                     logger.warning(
@@ -87,4 +91,33 @@ class Orchestrator:
         logger.info(
             f"📦 Orchestrator prepared {len(requests)} batch requests for QID {qid}"
         )
+        return requests, image_file_ids
+
+    async def prepare_combined_batch_requests(
+        self, question_data: ScienceQA, provider: str, model_id: str) -> tuple[list[Dict[str, Any]], list[str]]:
+        pil_images = []
+        image_file_ids: list[str] = []
+
+        if provider == "openai":
+            image_file_ids = await question_data.upload_images_to_openai(
+                self.openai_batch_service.client
+            )
+        else:
+            pil_images = await question_data.load_images()
+
+        req = self.combined_builder.prepare_single_request(
+            question_data=question_data,
+            provider=provider,
+            model_id=model_id,
+            pil_images=pil_images,
+            image_file_ids=image_file_ids,
+        )
+
+        requests: list[Dict[str, Any]] = []
+        if req is not None:
+            req["_provider"] = provider
+            req["_strategy"] = "combined"
+            req["_model_id"] = model_id
+            requests.append(req)
+
         return requests, image_file_ids

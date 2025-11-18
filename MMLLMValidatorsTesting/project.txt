@@ -3,154 +3,315 @@ src/__init__.py
 --------------------------------------------------
 
 --------------------------------------------------
-src/checkpoint.py
+src/combine_results.py
 --------------------------------------------------
-import os
-import json
-from typing import Dict, Any, Optional
-from filelock import FileLock, Timeout
+#!/usr/bin/env python3
+import argparse
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Combine multiple clean_results CSVs.")
+    parser.add_argument(
+        "-i",
+        "--input-dirs",
+        nargs="+",  # Accept one or more directories
+        required=True,
+        help="List of input directories (e.g., data/results/gemma327)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-file",
+        required=True,
+        help="Path for the final combined CSV file.",
+    )
+    parser.add_argument(
+        "-f",
+        "--filename",
+        default="clean_evaluation_results.csv",
+        help="The name of the CSV file to find in each directory.",
+    )
+    args = parser.parse_args()
+
+    all_dfs = []
+    input_dirs = [Path(d).expanduser().resolve() for d in args.input_dirs]
+    output_file = Path(args.output_file).expanduser().resolve()
+
+    print(f"Combining CSVs into {output_file}...")
+
+    for directory in input_dirs:
+        csv_path = directory / args.filename
+        if csv_path.exists():
+            print(f"  -> Loading {csv_path.relative_to(Path.cwd())}")
+            df = pd.read_csv(csv_path)
+            all_dfs.append(df)
+        else:
+            print(f"⚠️ Warning: File not found, skipping: {csv_path}")
+
+    if not all_dfs:
+        print("❌ Error: No CSV files were found to combine.", file=sys.stderr)
+        sys.exit(1)
+
+    combined_df = pd.concat(all_dfs, ignore_index=True)
+    
+    # Ensure the output directory exists
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    combined_df.to_csv(output_file, index=False)
+    print(f"\n✅ Success! Combined {len(all_dfs)} files ({len(combined_df)} rows) into:")
+    print(f"   {output_file}")
+
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------
+src/combined_traits_builder.py
+--------------------------------------------------
+from typing import Optional, Dict, Any, List
+from PIL import Image
 import logging
+import time
+from pathlib import Path
+from textwrap import dedent
+
+from src.llm_service.utils import image_to_data_url
+from src.config import settings
+from src.img_traits_def import ImgTraitDefinition
+from src.prompt_template import combi_system_prompt_template
+from src.science_qa import ScienceQA, build_question, build_characteristics
+from src_orig.orig_traits_def import OriginalTraitDefinition
+from src.llm_service.config import ConfigManager
+from src.llm_service.schemas import ValidationListSchema
+
 
 logger = logging.getLogger(__name__)
 
 
-def is_checkpoint(qid: str, trait: str, modelid: str, out_file: str) -> bool:
+class CombinedTraitsBuilder:
     """
-    Checks if a result for a given question id, trait, and model id is already present in the checkpoint file.
-    Args:
-        qid: The question ID to check
-        trait: the trait to check
-        modelid: the model id to check
-        out_file: Path to the checkpoint file.
-    Returns:
-        True if entry exists, False otherwise.
+    This class creates the prompt and the request payload to evaluate questions according to multiple traits.
     """
-    if not os.path.exists(out_file):
-        return False
 
-    lock_path = out_file + ".lock"
-    try:
-        with FileLock(lock_path, timeout=5):
-            with open(out_file, "r") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        if (
-                            str(entry.get("question_id")) == str(qid)
-                            and entry.get("trait") == trait
-                            and entry.get("model_id") == modelid
-                        ):
-                            return True
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            f"Skipping malformed JSON line in {out_file}: {line.strip()}"
-                        )
-                        continue
-    except Timeout:
-        logger.warning(f"Could not acquire lock to read {out_file} in time.")
-    except (OSError, IOError) as e:
-        logger.warning(f"Could not perform resume check on {out_file}: {e}")
-
-    return False
-
-
-def checkpoint(output: Dict[str, Any], out_file: str) -> bool:
-    """
-    Appends an output dictionary to a JSONL file if it's not already present.
-    Args:
-        output: Dictionary containing question id, trait, model id, and other results.
-        out_file: Path to the checkpoint file.
-    """
-    if (
-        not isinstance(output, dict)
-        or "qid" not in output
-        or "trait" not in output
-        or "model_id" not in output
+    def __init__(
+        self,
+        trait_list: List[str],
     ):
-        logger.error(f"Invalid output format for checkpointing: {output}")
-        return False
+        # Stricter input validation
+        self.config = ConfigManager()
+        for trait_name in trait_list:
+            if not trait_name or not trait_name.strip():
+                raise ValueError("Trait name cannot be empty or contain only whitespace.")
 
-    qid = str(output["qid"])
-    trait = str(output["trait"])
-    modelid = str(output["model_id"])
-    lock_path = out_file + ".lock"
+        #self.trait_name = trait_name.strip()
+        self.trait_definitions = ImgTraitDefinition()
+        self.trait_list = trait_list
+        self.trait_name = "combined_traits"
+        self.system_prompt = self._build_combined_system_prompt(combi_system_prompt_template)
+        
+        logger.info(f"CombinedTraitsBuilder initialized.")
 
-    try:
-        with FileLock(lock_path, timeout=10):
-            already_exists = False
-            if os.path.exists(out_file):
-                with open(out_file, "r") as f:
-                    for line in f:
-                        if not line.strip():
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            if (
-                                str(entry.get("qid")) == qid
-                                and entry.get("trait") == trait
-                                and entry.get("model_id") == modelid
-                            ):
-                                already_exists = True
-                                break
-                        except json.JSONDecodeError:
-                            continue
-            if already_exists:
-                logger.info(
-                    f"Skipping existing entry found inside lock: question_id={qid}, trait={trait}, model={modelid}"
-                )
-                return False
+    def _build_combined_system_prompt(self, combi_template: str) -> str:
+        """Helper function that uses the trait list to build a system prompt that uses all traits and their information instead of a single trait"""
+        traits_info_block = ""
+        all_traits = ", ".join(self.trait_list)
+        for trait_name in self.trait_list:
+            definition = self.trait_definitions.retrieve_definition(trait_name)
+            note = self.trait_definitions.retrieve_note(trait_name)
+            evaluation_questions = self.trait_definitions.retrieve_evaluation_questions(trait_name)
+            information = dedent("""
+            TRAIT: {trait_name}
+            DEFINITION: {definition}
+            FOCUS: {note}
 
-            with open(out_file, "a") as f:
-                json.dump(output, f)
-                f.write("\n")
-            logger.info(
-                f"Checkpointed: question_id={qid}, trait={trait}, model={modelid}"
+            -------------------------------
+            EVALUATION QUESTIONS:
+            {evaluation_questions}
+
+            ------------------------------- 
+            """)
+            
+            info = information.format(trait_name=trait_name, definition=definition, note=note, evaluation_questions=evaluation_questions)
+
+            traits_info_block += info
+
+        return combi_template.format(
+            traits_list=all_traits,
+            traits_info=traits_info_block,
+        )
+
+    def _create_user_prompt(self, question_data: ScienceQA) -> str:
+        """
+        Combines question, context, options, and characteristics into one user prompt.
+        """
+        question_str = build_question(question_data, format_str="QCMLE-A")
+        characteristics_str = build_characteristics(
+            question_data, format_str="GSTCSkTa"
+        )
+        return f"{characteristics_str}\n\n{question_str}"
+
+    def inputs_for(
+        self,
+        question_data: ScienceQA,
+        provider: str,
+        pil_images: Optional[List[Image.Image]] = None,
+        image_file_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Builds input messages.
+        For OpenAI: returns list for Responses API "input" field
+        For Nebius: returns list that will be added to messages array
+        """
+        user_text = self._create_user_prompt(question_data)
+
+        user_content: List[Dict[str, Any]] = [{"type": "input_text", "text": user_text}]
+
+        if provider == "openai":
+            if image_file_ids:
+                for fid in image_file_ids:
+                    user_content.append({"type": "input_image", "file_id": fid})
+
+            return [{"role": "user", "content": user_content}]
+
+        elif provider == "nebius":
+            # For Nebius, use Chat Completions format
+            content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+
+            if pil_images:
+                for img in pil_images:
+                    data_url = image_to_data_url(img)
+                    content.append(
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    )
+
+            return [{"role": "user", "content": content}]
+
+        return []
+
+    def prepare_single_request(
+        self,
+        question_data: ScienceQA,
+        provider: str,
+        model_id: str, 
+        pil_images: Optional[List[Image.Image]] = None,
+        image_file_ids: Optional[List[str]] = None,
+    ):
+        try:
+            qid = question_data.id
+            if provider == "openai":
+                model = settings["models"]["openai"][model_id]
+                request_url = "/v1/responses" 
+            elif provider == "nebius":
+                model = settings["models"]["nebius"][model_id]
+                request_url = "/v1/chat/completions"
+            else:
+                raise ValueError(f"Unknown provider: {provider}")
+
+            request_id = f"request-{model_id}-{self.trait_name}-{qid}-{int(time.time() * 1000)}"
+
+            openai_params = self.config.params.get("openai", {})
+            max_out = int(openai_params.get("max_tokens", 3000))
+
+            inputs = self.inputs_for(
+                question_data=question_data,
+                provider=provider,
+                pil_images=pil_images,
+                image_file_ids=image_file_ids,
             )
-            return True
-    except Timeout:
-        logger.error(
-            f"Could not acquire lock to write checkpoint for question_id={qid}, trait={trait}, model={modelid}"
-        )
 
-    except (OSError, IOError, TypeError) as e:
-        logger.error(
-            f"Failed to write checkpoint for question_id={qid}, trait={trait}, model={modelid}"
-        )
-    return False
+            
+
+            # Different payload based on provider
+            if provider == "openai":
+                schema = ValidationListSchema.model_json_schema()
+                payload = {
+                    "model": model,
+                    "instructions": self.system_prompt,
+                    "max_output_tokens": max_out,
+                    "input": inputs,
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": "validated_trait_list",
+                            "schema": schema,
+                            "strict": True,
+                        },
+                    },
+                }
+                # Reasoning effort only available for GPT5 models
+                if model_id.startswith("GPT5"):
+                    payload["reasoning"] = {"effort": "low"}
+                    payload["text"]["verbosity"] = "low"
+                
+                # GPT5 does not take temperature or top_p parameters in the payload
+                if not model_id.startswith("GPT5"):
+                    payload["temperature"] = 0
+                    payload["top_p"] = 1
+
+            else:  # nebius
+                schema = ValidationListSchema.model_json_schema()
+                messages = [{"role": "system", "content": self.system_prompt}]
+
+                for msg in inputs:
+                    if msg.get("role") == "user":
+                        messages.append(msg)
+
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "validated_trait_list",
+                            "schema": schema,
+                            "strict": True,
+                        },
+                    },
+                    "max_tokens": max_out,
+                }
+
+                if not model_id.startswith("GPT5"):
+                    payload["temperature"] = 0
+                    payload["top_p"] = 1
+
+            request_text = {
+                "custom_id": request_id,
+                "method": "POST",
+                "url": request_url,
+                "body": payload,
+            }
 
 
-def get_checkpointed_result(
-    qid: str, trait: str, modelid: str, out_file: str
-) -> Optional[Dict[str, Any]]:
-    """
-    Finds a result in the checkpoint file and returns it as a dictionary.
-    Returns None if no matching result is found.
-    """
+            return request_text
 
-    if not os.path.exists(out_file):
-        return None
+        except Exception as e:
+            logger.error(
+                f"Failed to prepare request for trait '{self.trait_name}': {e}"
+            )
+            return None
 
-    lock_path = out_file + ".lock"
+
+if __name__ == "__main__":
     try:
-        with FileLock(lock_path, timeout=5):
-            with open(out_file, "r") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-
-                    entry = json.loads(line)
-                    if (
-                        str(entry.get("qid")) == qid
-                        and entry.get("trait") == trait
-                        and modelid == entry.get("model_id")
-                    ):
-                        return entry
-    except (Timeout, IOError):
-        return None
-
-    return None
+        trait_def_path = Path(settings["paths"]["trait_definitions_json"])
+        if not trait_def_path.exists():
+            logger.error(f"Trait definitions JSON not found: {trait_def_path.resolve()}")
+            raise FileNotFoundError(f"Trait definitions JSON not found: {trait_def_path.resolve()}")
+        trait_def = ImgTraitDefinition(trait_def_path)
+        if not trait_def.traits:
+             logger.error("Trait definitions loaded but resulted in an empty traits dictionary.")
+             raise ValueError("Trait definitions loaded but resulted in an empty traits dictionary.")
+        trait_names = list(trait_def.traits.keys())
+        logger.info(f"🧬 Loaded {len(trait_names)} traits: {', '.join(trait_names)}")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize trait definitions: {e}")
+        
+    builder = CombinedTraitsBuilder(trait_list=trait_names)
+    
+   
 
 --------------------------------------------------
 src/config/__init__.py
@@ -601,6 +762,10 @@ if __name__ == "__main__":
 src/get_results.py
 --------------------------------------------------
 #!/usr/bin/env python3
+"""
+Script to normalize batch JSONL results to raw and clean CSV files.
+Uses ResultsHandler to parse one or more JSONL formats.
+"""
 from pathlib import Path
 import argparse
 import sys
@@ -610,6 +775,7 @@ from src.config import settings
 
 
 def main():
+    """Main execution function."""
     ap = argparse.ArgumentParser(description="Normalize batch JSONL to CSVs")
     ap.add_argument(
         "--jsonl",
@@ -626,6 +792,7 @@ def main():
     args = ap.parse_args()
 
     # Resolve JSONL input path
+    jsonl_path: Path
     if args.jsonl:
         jsonl_path = Path(args.jsonl).expanduser().resolve()
     else:
@@ -634,7 +801,7 @@ def main():
         jsonl_path = base.with_suffix(".results.jsonl")
 
     # Resolve output dir
-    outdir = (
+    outdir: Path = (
         Path(args.outdir).expanduser().resolve()
         if args.outdir
         else Path(settings["paths"]["results_dir"]).expanduser().resolve()
@@ -651,10 +818,12 @@ def main():
     raw_df = rh.load_batch_results_jsonl(jsonl_path)
     print(f"🧾 Parsed rows : {len(raw_df)}")
 
-    # Save raw now so you always get a file even if cleaning fails
+    if raw_df.empty:
+        print("⚠️ No rows were parsed. Exiting.")
+        sys.exit(0)
+
     rh.save_raw_results(raw_df)
 
-    # Try cleaning; if it fails, keep raw and print helpful info
     try:
         clean_df = rh.clean_results(raw_df)
     except Exception as e:
@@ -664,11 +833,17 @@ def main():
             print("🔎 Raw sample:\n", raw_df.head(5))
         sys.exit(2)
 
+    if clean_df.empty:
+        print("⚠️ Cleaning resulted in an empty DataFrame. Check raw results.")
+        sys.exit(0)
+        
     rh.save_clean_results(clean_df)
 
     print(f"✅ Clean CSV: {rh.CLEAN_RESULTS_FILENAME.resolve()}")
     with pd.option_context("display.max_columns", None, "display.width", 200):
+        print("\n--- Clean Results Sample ---")
         print(clean_df.head(10).to_string(index=False))
+        print("----------------------------")
 
 
 if __name__ == "__main__":
@@ -1283,7 +1458,7 @@ class OpenAIProvider(BaseProvider):
 --------------------------------------------------
 src/llm_service/schemas.py
 --------------------------------------------------
-from typing import Optional
+from typing import List
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -1294,25 +1469,71 @@ class ValidationSchema(BaseModel):
 
     trait: str = Field(..., description="The name of the trait being evaluated.")
     validity: bool = Field(..., description="True if the trait is valid.")
-    reasoning: Optional[str] = None
+    reasoning: str = Field(
+        ..., 
+        description="Explanation for invalid traits. Empty string when validity is True."
+    )
 
     @classmethod
     def model_json_schema(cls):
+        """
+        Generates a JSON schema where ALL fields are required,
+        and 'reasoning' is a non-nullable string.
+        """
         schema = super().model_json_schema()
+
         if "properties" in schema:
+            # All fields required
             schema["required"] = list(schema["properties"].keys())
+
+            # Ensure reasoning cannot be null
+            reasoning_field = schema["properties"].get("reasoning", {})
+            reasoning_field.pop("nullable", None)
+            reasoning_field["type"] = "string"
+
         return schema
 
     @model_validator(mode="after")
     def _enforce_reasoning_rules(self):
+        """
+        Internal correctness:
+        - validity=True  -> reasoning=""
+        - validity=False -> reasoning must be a non-empty string
+        """
         if self.validity is True:
-            self.reasoning = None
+            self.reasoning = ""
         else:
-            if self.reasoning is None or not str(self.reasoning).strip():
+            if not self.reasoning or not self.reasoning.strip():
                 raise ValueError(
                     "When validity is False, 'reasoning' must be a non-empty string."
                 )
         return self
+
+
+class ValidationListSchema(BaseModel):
+    """Output schema for combined evaluation of all traits."""
+
+    model_config = {"extra": "forbid"}
+
+    traits_output: List[ValidationSchema] = Field(
+        ..., description="A list of validation results for all traits."
+    )
+
+    @classmethod
+    def model_json_schema(cls):
+        schema = super().model_json_schema()
+
+        if "properties" in schema:
+            # All fields required
+            schema["required"] = list(schema["properties"].keys())
+
+            # Ensure nested ValidationSchema.reasoning is non-nullable
+            items_schema = schema["properties"]["traits_output"].get("items", {})
+            reasoning = items_schema.get("properties", {}).get("reasoning", {})
+            reasoning.pop("nullable", None)
+            reasoning["type"] = "string"
+
+        return schema
 
 --------------------------------------------------
 src/llm_service/service.py
@@ -1711,7 +1932,6 @@ def retry_with_backoff(
 --------------------------------------------------
 src/main.py
 --------------------------------------------------
-#!/usr/bin/env python3
 import asyncio
 import pandas as pd
 from pathlib import Path
@@ -1738,6 +1958,7 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(level: str = "INFO"):
     """Configure logging for the application"""
+ 
     logging.basicConfig(
         level=getattr(logging, level.upper()),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1758,6 +1979,7 @@ async def test_models_batch(
     model_ids: List[str],
     data: pd.DataFrame,
     orchestrator: Orchestrator,
+    mode: str, # <-- ADDED
 ) -> List[Dict[str, Any]]:
     """
     Collect all batch requests across models and questions.
@@ -1767,20 +1989,23 @@ async def test_models_batch(
 
     for model_id in model_ids:
         provider = get_provider_from_model_id(model_id=model_id)
-        print(f"\n📋 Collecting requests for {model_id} (Provider: {provider})...")
+        # UPDATED print statement
+        print(f"\n📋 Collecting requests for {model_id} (Provider: {provider}, Mode: {mode})...")
 
         for i, (_, row) in enumerate(data.iterrows()):
             question = ScienceQA.from_df_row(row)
 
-            requests, _ = await orchestrator.prepare_batch_requests(
-                question, provider, model_id
-            )
+            if mode in ("single", "both"):
+                single_reqs, _ = await orchestrator.prepare_batch_requests(
+                    question, provider, model_id
+                )
+                all_requests.extend(single_reqs)
 
-            for request in requests:
-                request["_provider"] = provider
-
-            all_requests.extend(requests)
-
+            if mode in ("combined", "both"):
+                combined_reqs, _ = await orchestrator.prepare_combined_batch_requests(
+                    question, provider, model_id
+                )
+                all_requests.extend(combined_reqs)
             if (i + 1) % 5 == 0:
                 print(f"  📝 Processed {i + 1}/{total_questions} questions")
 
@@ -1807,13 +2032,12 @@ async def monitor_batch_progress(
                 if error_file_id:
                     _log.warning("⚠️ Batch has errors, checking error file...")
                     try:
-                        # TODO: solve this "client" problem
                         error_content = batch_service.client.files.content(
                             error_file_id
                         )
                         text_preview = getattr(error_content, "text", None)
                         if text_preview:
-                            _log.error(f"First error: {text_preview[:500]}...")
+                            _log.error(f"First error: {text_preview[:1000]}...")
                     except Exception as e:
                         _log.error(f"Could not retrieve error file: {e}")
 
@@ -1834,12 +2058,40 @@ async def monitor_batch_progress(
             await asyncio.sleep(check_interval)
 
 
+
 async def main(args):
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
 
+    trait_def = ImgTraitDefinition(Path(settings["paths"]["trait_definitions_json"]))
+    trait_list = list(trait_def.traits.keys())
+    orchestrator = Orchestrator(
+        trait_names=trait_list,
+    )
     # --- Ad-hoc Batch Commands ---
     # These commands operate on a single provider, specified by the --provider flag.
+    # --- Check for batch error retrieval ---
+    if args.batch_error:
+        if args.provider != "openai":
+            print("❌ Only OpenAI batches support error file retrieval currently.")
+            return
+
+        batch_service: OpenAIBatchService = orchestrator.openai_batch_service
+        status = batch_service.get_batch_status(args.batch_error)
+        error_file_id = status.get("error_file_id")
+
+        if error_file_id:
+            try:
+                import openai
+                content = openai.File.download(error_file_id)
+                text = content.decode("utf-8")
+                print(f"\n⚠️ Error file for batch {args.batch_error}:\n")
+                print(text[:2000])  # show first 2k chars
+            except Exception as e:
+                print(f"❌ Failed to download error file: {e}")
+        else:
+            print(f"✅ Batch {args.batch_error} has no error file.")
+        return  # exit after handling
     if (
         args.list_batches
         or args.cancel_batch
@@ -1928,32 +2180,24 @@ async def main(args):
                 args.download_batch, str(output_path)
             )
             if success:
-                print(f"📥 Results downloaded to: {output_path}")
+                (f"📥 Results downloaded to: {output_path}")
 
         return  # Exit after running the ad-hoc command
 
     # --- Main Evaluation Logic ---
 
-    # Load Configuration & Data (no changes here)
-    trait_def = ImgTraitDefinition(Path(settings["paths"]["trait_definitions_json"]))
-    trait_list = list(trait_def.traits.keys())
-    orig_trait_def = OriginalTraitDefinition(
-        Path(settings["paths"]["orig_trait_definitions_json"])
-    )
-    orig_trait_list = list(orig_trait_def.traits.keys())
     test_df = pd.read_csv(Path(settings["paths"]["input_data_csv"])).head(
         args.num_questions
     )
-    model_ids_to_test = args.models.split(",") if args.models else ["GPT4o"]
+    model_ids_to_test = args.models.split(",") if args.models else ["GPT5Nano"]
 
-    # Create the Orchestrator once. It now manages all its own internal services.
+    # Create the Orchestrator once.
     orchestrator = Orchestrator(
         trait_names=trait_list,
-        checkpoint_file=settings["paths"]["checkpoint_json"],
     )
 
     if args.batch:
-        print("\n🚀 BATCH MODE: Collecting requests...")
+        print(f"\n🚀 BATCH MODE: Collecting requests (Mode: {args.mode})...")
 
         # If a pre-built JSONL file was provided, skip generating requests
         if args.batch_file:
@@ -1985,41 +2229,70 @@ async def main(args):
             return  # done
 
         # --- Otherwise: generate requests as before ---
-        all_requests = await test_models_batch(model_ids_to_test, test_df, orchestrator)
 
-        openai_requests = []
-        nebius_requests = []
+        all_requests = await test_models_batch(
+            model_ids_to_test, test_df, orchestrator,
+            mode=args.trait_mode
+        )
 
-        for request in all_requests:
-            provider = request.pop("_provider", "openai")
+        # Group by provider, strategy, and model so each model gets its own JSONL.
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for r in all_requests:
+            provider = r.get("_provider")
+            strategy = r.get("_strategy", "single")
+            model_id = r.get("_model_id", "unknown")
+            if provider is None:
+                continue
+            key = (provider, strategy, model_id)
+            groups.setdefault(key, []).append(r)
+
+        # Helper to drop internal metadata keys (those starting with "_")
+        def _clean(reqs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [{k: v for k, v in r.items() if not k.startswith("_")} for r in reqs]
+
+        base_path = Path(settings["paths"]["batch_request_file"])
+
+        for (provider, strategy, model_id), reqs in groups.items():
+            cleaned = _clean(reqs)
+            safe_model = "".join(c if c.isalnum() else "_" for c in model_id)
+            suffix_provider = "openai" if provider == "openai" else "nebius"
+            output_file = base_path.with_name(
+                f"{base_path.stem}_{suffix_provider}_{safe_model}_{strategy}{base_path.suffix}"
+            )
+
+            # Choose correct batch service
             if provider == "openai":
-                openai_requests.append(request)
+                orchestrator.openai_batch_service.write_jsonl_file(cleaned, str(output_file))
             elif provider == "nebius":
-                nebius_requests.append(request)
+                orchestrator.nebius_batch_service.write_jsonl_file(cleaned, str(output_file))
+            else:
+                continue
 
-        # If we have OpenAI requests, write or submit
-        if openai_requests:
-            # Default destination path from config (unchanged)
-            openai_file = Path(settings["paths"]["batch_request_file"])
-            orchestrator.openai_batch_service.write_jsonl_file(openai_requests, str(openai_file))
-            print(f"💾 Saved {len(openai_requests)} OpenAI requests to: {openai_file}")
+            print(f"💾 Saved {len(cleaned)} {provider.upper()} {strategy} requests for {model_id} to: {output_file}")
 
-            if args.submit_batch:
-                batch_id = orchestrator.openai_batch_service.submit_batch(str(openai_file), args.batch_name)
+            # Optionally submit this file depending on strategy / trait_mode
+            should_submit = args.submit_batch and (
+                args.trait_mode == strategy or args.trait_mode == "both"
+            )
+            if not should_submit:
+                continue
+
+            if provider == "openai":
+                batch_id = orchestrator.openai_batch_service.submit_batch(
+                    str(output_file), args.batch_name
+                )
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(batch_id, orchestrator.openai_batch_service, args.check_interval)
-
-        # Nebius requests: write or submit
-        if nebius_requests:
-            base_path = Path(settings["paths"]["batch_request_file"])
-            nebius_file = base_path.with_name(f"{base_path.stem}_nebius{base_path.suffix}")
-            orchestrator.nebius_batch_service.write_jsonl_file(nebius_requests, str(nebius_file))
-            print(f"💾 Saved {len(nebius_requests)} Nebius requests to: {nebius_file}")
-
-            if args.submit_batch:
-                batch_id = orchestrator.nebius_batch_service.submit_batch(str(nebius_file), args.batch_name)
+                    await monitor_batch_progress(
+                        batch_id, orchestrator.openai_batch_service, args.check_interval
+                    )
+            elif provider == "nebius":
+                batch_id = orchestrator.nebius_batch_service.submit_batch(
+                    str(output_file), args.batch_name
+                )
                 if batch_id and args.monitor:
-                    await monitor_batch_progress(batch_id, orchestrator.nebius_batch_service, args.check_interval)
+                    await monitor_batch_progress(
+                        batch_id, orchestrator.nebius_batch_service, args.check_interval
+                    )
 
 
 if __name__ == "__main__":
@@ -2040,6 +2313,13 @@ if __name__ == "__main__":
         help="Path to an existing JSONL batch file to submit (skip writing new JSONL).",
     )
 
+    parser.add_argument(
+        "-tm",
+        "--trait-mode",
+        choices=["single", "combined", "both"],
+        default="both",
+        help="How to build batch requests: per-trait agents, combined traits, or both. Default: both."
+    )
 
     parser.add_argument(
         "-p",
@@ -2122,8 +2402,161 @@ if __name__ == "__main__":
         default=300,
         help="Batch monitoring interval in seconds (default: 300)",
     )
+    
+    parser.add_argument(
+        "--batch-error",
+        type=str,
+        help="Retrieve and display error file for failed batch by ID",
+    )
+    # --- SINGLE VS MULTIPLE TRAIT COMPARISON ---  #TODO: update this
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="singular",
+        choices=["singular", "combined"],
+        help="Evaluation mode: 'singular' (one request per trait) or 'combined' (one request for all traits)."
+    )
+    
     args = parser.parse_args()
     asyncio.run(main(args))
+
+--------------------------------------------------
+src/normalize_nebius.py
+--------------------------------------------------
+#!/usr/bin/env python3
+import json
+import sys
+import argparse
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+
+def transform_line(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Transforms a Nebius JSONL line into the specific
+    format expected by the user's ResultsHandler.
+    (i.e., response.body.output[...].text)
+    """
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        print(f"Skipping bad JSON line: {line[:50]}...", file=sys.stderr)
+        return None
+
+    # Check if it's already in the target format (has body.output)
+    if (
+        data.get("response")
+        and isinstance(data["response"], dict)
+        and data["response"].get("body")
+        and isinstance(data["response"]["body"], dict)
+        and "output" in data["response"]["body"]
+    ):
+        return data  # It's already converted or is an OpenAI file
+
+    original_response = data.get("response")
+    original_error = data.get("error")
+    new_response_wrapper: Dict[str, Any] = {}
+
+    # If there's no response, just format the error
+    if not original_response or not isinstance(original_response, dict):
+        new_response_wrapper = {
+            "status_code": 500,
+            "request_id": None,
+            "body": {"error": original_error or "Missing response object"},
+        }
+    else:
+        # This is the Nebius "response" object:
+        # {"id": "chatcmpl-...", "choices": [...], "created": ..., "model": ...}
+
+        # Extract the content string
+        text_content = None
+        try:
+            text_content = original_response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            print(
+                f"Warning: Could not find text content for custom_id {data.get('custom_id')}",
+                file=sys.stderr,
+            )
+
+        # --- THIS IS THE CRITICAL CHANGE ---
+        # Build the nested 'body' structure that ResultsHandler expects
+        new_body = {
+            "model": original_response.get("model"),
+            "created_at": original_response.get("created"),
+            "status": "completed" if text_content else "failed",
+            "error": None,
+            "output": [  # The 'output' list
+                {
+                    "content": [  # The 'content' list
+                        {
+                            "type": "output_text",
+                            "text": text_content,  # Put the JSON string here
+                        }
+                    ]
+                }
+            ],
+        }
+        # --- END OF CHANGE ---
+
+        new_response_wrapper = {
+            "status_code": 200,
+            "request_id": original_response.get("id"),
+            "body": new_body,  # Use our newly constructed body
+        }
+
+    # Reconstruct the top-level object
+    new_data = {
+        "id": data.get("id"),
+        "custom_id": data.get("custom_id"),
+        "response": new_response_wrapper,
+        "error": original_error,  # This is the top-level Nebius error, if any
+    }
+
+    return new_data
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert Nebius batch JSONL to the format expected by ResultsHandler."
+    )
+    parser.add_argument(
+        "input_file",
+        type=Path,
+        help="Path to the original Nebius results JSONL file.",
+    )
+    parser.add_argument(
+        "output_file",
+        type=Path,
+        help="Path to write the new custom-formatted JSONL file.",
+    )
+    args = parser.parse_args()
+
+    args.input_file = args.input_file.expanduser().resolve()
+    args.output_file = args.output_file.expanduser().resolve()
+
+    if not args.input_file.exists():
+        print(f"❌ Input file not found: {args.input_file}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Converting {args.input_file.name} -> {args.output_file.name}")
+
+    lines_processed = 0
+    lines_written = 0
+
+    with open(args.input_file, "r") as infile, open(args.output_file, "w") as outfile:
+        for line in infile:
+            lines_processed += 1
+            transformed_data = transform_line(line)
+
+            if transformed_data:
+                outfile.write(json.dumps(transformed_data) + "\n")
+                lines_written += 1
+
+    print(f"✅ Done. Processed {lines_processed} lines, wrote {lines_written} lines.")
+
+
+if __name__ == "__main__":
+    main()
 
 --------------------------------------------------
 src/orchestrator.py
@@ -2134,6 +2567,7 @@ import logging
 from src.trait_agent import TraitAgent
 from src.llm_service.service import OpenAIBatchService, NebiusBatchService
 from src.science_qa import ScienceQA
+from src.combined_traits_builder import CombinedTraitsBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -2148,16 +2582,18 @@ class Orchestrator:
 
     def __init__(
         self,
-        trait_names: List[str],
-        checkpoint_file: Optional[str] = None,
+        trait_names: List[str]
     ):
         logger.info("🎶 Initializing Sequential Orchestrator...")
 
         self.openai_batch_service = OpenAIBatchService()
         self.nebius_batch_service = NebiusBatchService()
 
-        self.all_agents = [TraitAgent(name) for name in trait_names]
-        self.checkpoint_file = checkpoint_file
+        # self.all_agents = [TraitAgent(name) for name in trait_names]  ALL TRAITS
+        self.all_agents = [TraitAgent(name) for name in trait_names]  
+
+        # combined builder to check all traits at once for each question
+        self.combined_builder = CombinedTraitsBuilder(trait_list=trait_names)
 
         logger.info(f"✅ Orchestrator created with {len(self.all_agents)} agents.")
 
@@ -2202,6 +2638,8 @@ class Orchestrator:
 
                 if request is not None:
                     request["_provider"] = provider
+                    request["_strategy"] = "single"
+                    request["_model_id"] = model_id
                     requests.append(request)
                 else:
                     logger.warning(
@@ -2216,6 +2654,35 @@ class Orchestrator:
         logger.info(
             f"📦 Orchestrator prepared {len(requests)} batch requests for QID {qid}"
         )
+        return requests, image_file_ids
+
+    async def prepare_combined_batch_requests(
+        self, question_data: ScienceQA, provider: str, model_id: str) -> tuple[list[Dict[str, Any]], list[str]]:
+        pil_images = []
+        image_file_ids: list[str] = []
+
+        if provider == "openai":
+            image_file_ids = await question_data.upload_images_to_openai(
+                self.openai_batch_service.client
+            )
+        else:
+            pil_images = await question_data.load_images()
+
+        req = self.combined_builder.prepare_single_request(
+            question_data=question_data,
+            provider=provider,
+            model_id=model_id,
+            pil_images=pil_images,
+            image_file_ids=image_file_ids,
+        )
+
+        requests: list[Dict[str, Any]] = []
+        if req is not None:
+            req["_provider"] = provider
+            req["_strategy"] = "combined"
+            req["_model_id"] = model_id
+            requests.append(req)
+
         return requests, image_file_ids
 
 --------------------------------------------------
@@ -2253,6 +2720,39 @@ REQUIRED OUTPUT FORMAT (STRICT SCHEMA):
 # EXAMPLES:
 # {examples}
 
+combi_system_prompt_template = """
+⚠️ CRITICAL: You are evaluating the IMAGE'S visual design quality, NOT looking for question text within the image. The question is provided separately. Do NOT expect to see the question or answer options written inside the image.
+
+You are evaluating whether an image demonstrates good visual design for the following traits: "{traits_list}".
+-------------------------------
+TRAITS TO EVALUATE:
+{traits_info}
+
+-------------------------------
+COMMON MISTAKES TO AVOID:
+❌ "The image doesn't contain the question text" - CORRECT: Question text is provided separately
+❌ "I can't see answer options in the image" - CORRECT: Options aren't supposed to be in the image
+❌ "The image doesn't show the question" - EVALUATE: The image's visual design quality only
+✅ FOCUS ON: Visual design principles of the image itself
+
+-------------------------------
+
+REQUIRED OUTPUT FORMAT (STRICT SCHEMA):
+You MUST return a JSON object with a single key "traits_output".
+"traits_output" MUST be a LIST of JSON objects, one for each trait.
+
+- When validity is true, reasoning MUST be null.
+- When validity is false, reasoning MUST be a non-empty string.
+
+The final output MUST look structurally like:
+{{
+  "traits_output": [
+    {{"trait": "TraitName1", "validity": true,  "reasoning": null}},
+    {{"trait": "TraitName2", "validity": false, "reasoning": "Brief explanation of design flaw (ONE SENTENCE)"}},
+    {{"trait": "TraitName3", "validity": true,  "reasoning": null}}
+  ]
+}}
+""".strip()
 
 origin_system_prompt_template = """
 ⚠️ CRITICAL: You are an expert in educational design. Evaluate a multiple-choice question based on a SINGLE trait. Focus ONLY on that trait.
@@ -2321,6 +2821,12 @@ class ResultsHandler:
     )
 
     def __init__(self, results_dir: Path):
+        """
+        Initializes the ResultsHandler.
+
+        Args:
+            results_dir: The directory to store result files.
+        """
         self.RESULTS_DIR = results_dir
         self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2385,20 +2891,61 @@ class ResultsHandler:
         return df[cols]
 
     def _parse_batch_object(self, obj: Dict[str, Any], ln: int) -> Dict[str, Any]:
-        """Parse a single JSONL object from the batch output into normalized fields."""
-        custom_id = obj.get("custom_id", "")
-        response = obj.get("response", {}) or {}
-        status_code = response.get("status_code")
-        body = response.get("body", {}) or {}
+        """
+        Parse a single JSONL object from the batch output into normalized fields.
+        Detects the response format (Batch API vs. Chat Completion) and routes parsing.
+        """
+        custom_id: str = obj.get("custom_id", "")
+        response: Dict[str, Any] = obj.get("response", {}) or {}
 
-        # OpenAI response metadata
-        model_reported = body.get("model")
-        created_at = body.get("created_at")
-        req_status = body.get("status")
-        error = body.get("error")
-        request_id = response.get("request_id")
+        text_payload: Optional[str] = None
+        raw_text: Optional[str] = None
 
-        # Derive fields from custom_id
+        # OpenAI response metadata - declare with defaults
+        model_reported: Optional[str] = None
+        created_at: Optional[int] = None
+        req_status: Optional[str] = None
+        error: Optional[Any] = None
+        request_id: Optional[str] = None
+        status_code: Optional[int] = None
+
+        # --- DETECTION LOGIC ---
+
+        # Format 1: New Chat Completion format (e.g., from Gemma, Cohere, etc.)
+        # Has "choices" and "model" directly in the response object.
+        if "choices" in response and "model" in response:
+            status_code = 200 if obj.get("error") is None else 500  # Infer
+            model_reported = response.get("model")
+            created_at = response.get("created")
+            req_status = "completed" if obj.get("error") is None else "failed"
+            error = obj.get("error")
+            request_id = response.get("id")
+
+            text_payload = self._extract_output_text_chat_completion(response)
+
+        # Format 2: Original Batch API format
+        # Has "status_code" and "body" in the response object.
+        elif "status_code" in response and "body" in response:
+            status_code = response.get("status_code")
+            body = response.get("body", {}) or {}
+            model_reported = body.get("model")
+            created_at = body.get("created_at")
+            req_status = body.get("status")
+            error = body.get("error")
+            request_id = response.get("request_id")
+
+            text_payload = self._extract_output_text_batch_api(body)
+
+        # Format 3: Error or unknown structure
+        else:
+            status_code = response.get("status_code")  # Best guess
+            req_status = "unknown_format"
+            error = obj.get("error") or str(response)[:250]  # Save snippet as error
+            request_id = obj.get("id") or response.get("id")
+
+        # --- END DETECTION LOGIC ---
+
+        # Derive fields from custom_id (this logic is unchanged)
         trait_hint = qid = ts = None
         model_alias = None
         m = self.CID_RX.search(custom_id) if isinstance(custom_id, str) else None
@@ -2407,11 +2954,12 @@ class ResultsHandler:
             trait_hint = m.group("trait")
             qid = m.group("qid")
             ts = m.group("ts")
+        else:
+            # Debug: print problematic custom_ids
+            print(f"Warning: Could not parse custom_id at line {ln}: '{custom_id}'")
 
-        # Extract JSON payload returned by the model (strict schema)
-        text_payload = self._extract_output_text(body)
+        # Extract JSON payload returned by the model
         inner_json: Dict[str, Any] = {}
-        raw_text = None
         if text_payload:
             try:
                 inner_json = json.loads(text_payload)
@@ -2437,7 +2985,7 @@ class ResultsHandler:
             "model_id": model_alias
             or model_reported,  # prefer alias, fallback to reported
             "trait": trait,
-            "question_id": qid,
+            "question_id": qid,  # This will be None if custom_id parsing failed
             "timestamp_token": ts,
             "validity": validity,
             "reasoning": reasoning,
@@ -2445,9 +2993,42 @@ class ResultsHandler:
         }
 
     @staticmethod
-    def _extract_output_text(body: Dict[str, Any]) -> Optional[str]:
+    def _extract_output_text_chat_completion(
+        response: Dict[str, Any],
+    ) -> Optional[str]:
         """
-        Extract the inner JSON string emitted by the model under Responses API:
+        Extracts the inner JSON string from a standard Chat Completion API response:
+        response.choices[0].message.content
+        """
+        try:
+            choices = response.get("choices", [])
+            if not isinstance(choices, list) or not choices:
+                return None
+
+            message = choices[0].get("message", {})
+            if not isinstance(message, dict):
+                return None
+
+            content = message.get("content")
+            if not isinstance(content, str):
+                return None
+
+            # Apply the same stripping logic from the original function
+            t = content.strip()
+            if t.startswith("```"):
+                t = t.strip("`")
+                # after stripping ticks, if it contains json prefix, try to cut it down
+                if t.lower().startswith("json"):
+                    t = t[4:].strip()
+            return t
+        except (IndexError, AttributeError, TypeError) as e:
+            print(f"Error parsing chat completion output: {e}")
+            return None
+
+    @staticmethod
+    def _extract_output_text_batch_api(body: Dict[str, Any]) -> Optional[str]:
+        """
+        Extract the inner JSON string emitted by the model under *OLD* Responses API:
         body.output -> list[message]; message.content -> list[parts]; parts[type=="output_text"].text
         """
         out = body.get("output", [])
@@ -2499,8 +3080,6 @@ class ResultsHandler:
             f"💾 Raw results saved to {self.RAW_RESULTS_FILENAME} ({'OK' if ok else 'MISSING'}, {size} bytes)"
         )
 
-    # Add this method to your ResultsHandler class:
-
     def save_clean_results(self, df: pd.DataFrame):
         """Saves the cleaned DataFrame to a CSV file."""
         self.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2511,73 +3090,7 @@ class ResultsHandler:
             f"✅ Clean results saved to {self.CLEAN_RESULTS_FILENAME} ({'OK' if ok else 'MISSING'}, {size} bytes)"
         )
 
-    # Also, fix the _parse_batch_object method to handle question_id parsing better:
-
-    def _parse_batch_object(self, obj: Dict[str, Any], ln: int) -> Dict[str, Any]:
-        """Parse a single JSONL object from the batch output into normalized fields."""
-        custom_id = obj.get("custom_id", "")
-        response = obj.get("response", {}) or {}
-        status_code = response.get("status_code")
-        body = response.get("body", {}) or {}
-
-        # OpenAI response metadata
-        model_reported = body.get("model")
-        created_at = body.get("created_at")
-        req_status = body.get("status")
-        error = body.get("error")
-        request_id = response.get("request_id")
-
-        # Derive fields from custom_id
-        trait_hint = qid = ts = None
-        model_alias = None
-        m = self.CID_RX.search(custom_id) if isinstance(custom_id, str) else None
-        if m:
-            model_alias = m.group("model")
-            trait_hint = m.group("trait")
-            qid = m.group("qid")
-            ts = m.group("ts")
-        else:
-            # Debug: print problematic custom_ids
-            print(f"Warning: Could not parse custom_id at line {ln}: '{custom_id}'")
-
-        # Extract JSON payload returned by the model (strict schema)
-        text_payload = self._extract_output_text(body)
-        inner_json: Dict[str, Any] = {}
-        raw_text = None
-        if text_payload:
-            try:
-                inner_json = json.loads(text_payload)
-            except json.JSONDecodeError:
-                raw_text = text_payload  # preserve raw for debugging
-
-        trait = inner_json.get("trait") if inner_json else None
-        if trait is None:
-            trait = trait_hint  # fallback to custom_id
-
-        validity = self._coerce_bool(inner_json.get("validity") if inner_json else None)
-        reasoning = inner_json.get("reasoning") if inner_json else None
-
-        return {
-            "_line": ln,
-            "custom_id": custom_id,
-            "request_id": request_id,
-            "http_status": status_code,
-            "request_status": req_status,
-            "created_at": created_at,
-            "error": error,
-            "model_reported": model_reported,
-            "model_id": model_alias
-            or model_reported,  # prefer alias, fallback to reported
-            "trait": trait,
-            "question_id": qid,  # This will be None if custom_id parsing failed
-            "timestamp_token": ts,
-            "validity": validity,
-            "reasoning": reasoning,
-            "_raw_text": raw_text,
-        }
-
-    # And update the clean_results method to be more informative about the question_id issue:
-
+    # This is your advanced cleaning method, kept intact
     def clean_results(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Filters out rows with errors or invalid data.
@@ -2696,6 +3209,10 @@ class ResultsHandler:
                 "gpt-4o", na=False
             ) & ~clean_df["model_id"].str.startswith("gpt-4o-mini", na=False)
             clean_df.loc[mask_4o, "model_id"] = "GPT4o"
+            
+            # Handle Gemma
+            mask_gemma = clean_df["model_id"].str.contains("gemma", na=False, case=False)
+            clean_df.loc[mask_gemma, "model_id"] = "Gemma" # Standardize
 
         # Fill missing trait values from custom_id if possible
         if "trait" in clean_df.columns:
@@ -2786,27 +3303,41 @@ src/run_all_models.py
 --------------------------------------------------
 #!/usr/bin/env python3
 import asyncio
-import logging
+import logging # Import logging at the top
 from pathlib import Path
+from sys import prefix
 import pandas as pd
 from datetime import datetime
+import json # Import json for potential debugging if needed
 
 from src.config import settings
 from src.orchestrator import Orchestrator
 from src.img_traits_def import ImgTraitDefinition
 from src.science_qa import ScienceQA
 
+# ---------- Setup logging at the MODULE LEVEL ----------
+# Configure logging basic settings first
+logging.basicConfig(
+    level=logging.INFO, # Default level, can be overridden later if needed
+    format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Create the named logger for this module
+logger = logging.getLogger("run_all_models")
+
 
 # ---------- PROVIDER DETECTION ----------
 def get_provider_from_model_id(model_id: str) -> str:
     """Determines provider based on model ID pattern."""
     mid = model_id.upper()
-    if mid.startswith("GPT"):        # e.g., GPT4o, GPT4oMini
+    if mid.startswith("GPT"):     # e.g., GPT4o, GPT4oMini
         return "openai"
-    elif mid.startswith("L_"):       # e.g., L_Gemma34B, L_Qwen25VL72B
+    elif mid.startswith("L_"):    # e.g., L_Gemma34B, L_Qwen25VL72B
         return "nebius"
-    raise ValueError(f"❌ Could not determine provider for model '{model_id}'")
-
+    # Add more prefixes if needed
+    # --- FIXED: logger is now accessible here ---
+    logger.warning(f"⚠️ Could not determine provider for model '{model_id}', assuming 'unknown'.")
+    return "unknown"
 
 # ---------- CLEANING UTIL ----------
 def clean_requests(requests: list) -> list:
@@ -2816,108 +3347,238 @@ def clean_requests(requests: list) -> list:
 
 # ---------- MAIN RUNNER ----------
 async def run_all_models(num_questions: int = 100):
-    """Prepare batch JSONL files for all models defined in config (OpenAI + Nebius)."""
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logger = logging.getLogger("run_all_models")
-    logger.info("🚀 Starting batch preparation for all models...")
+    """
+    Prepare **one batch JSONL file per model** defined in config (OpenAI + Nebius).
+    """
+    # Logging is already configured at module level
+    logger.info("🚀 Starting batch preparation - **one file per model**...")
 
     # --- Load models from config ---
-    all_models = settings.get("all_models", {})
-    if not all_models:
-        raise RuntimeError("❌ No models found in settings['all_models']!")
+    all_models_dict = settings.get("all_models", {})
+    if not all_models_dict:
+        # Use logger defined at module level
+        logger.error("❌ No models found in settings['all_models']!")
+        raise RuntimeError("No models found in settings['all_models']!")
 
-    logger.info(f"🧠 Found {len(all_models)} total models to process:")
-    for m in all_models:
-        provider = get_provider_from_model_id(m)
-        logger.info(f"   • {m} ({provider})")
+    model_ids_to_process = list(all_models_dict.keys())
+    logger.info(f"🧠 Found {len(model_ids_to_process)} total models to process:")
+    for m_alias in model_ids_to_process:
+        try:
+            provider = get_provider_from_model_id(m_alias)
+            actual_name = all_models_dict[m_alias]
+            logger.info(f"    - {m_alias} (Provider: {provider}, API Name: {actual_name})")
+        except ValueError as e:
+             logger.error(f"    - Error determining provider for {m_alias}: {e}")
+        except KeyError:
+             logger.error(f"    - Error: Model alias '{m_alias}' found in list but not in 'all_models' dict.")
+
 
     # --- Load dataset ---
     csv_path = Path(settings["paths"]["input_data_csv"])
-    df = pd.read_csv(csv_path).head(num_questions)
-    logger.info(f"📚 Loaded {len(df)} questions from: {csv_path.resolve()}")
+    if not csv_path.exists():
+         logger.error(f"❌ Input data CSV not found at: {csv_path.resolve()}")
+         raise FileNotFoundError(f"Input data CSV not found at: {csv_path.resolve()}")
+    try:
+        df = pd.read_csv(csv_path)
+        if num_questions > 0 and num_questions < len(df):
+            df = df.head(num_questions)
+            logger.info(f"📚 Loaded {len(df)} questions (limited by num_questions={num_questions}) from: {csv_path.resolve()}")
+        else:
+             logger.info(f"📚 Loaded all {len(df)} questions from: {csv_path.resolve()}")
+    except Exception as e:
+        logger.error(f"❌ Failed to load or process CSV '{csv_path}': {e}")
+        return
+
 
     # --- Initialize orchestrator and traits ---
-    trait_def = ImgTraitDefinition(Path(settings["paths"]["trait_definitions_json"]))
-    orchestrator = Orchestrator(
-        trait_names=list(trait_def.traits.keys()),
-        checkpoint_file=settings["paths"]["checkpoint_json"],
-    )
+    try:
+        trait_def_path = Path(settings["paths"]["trait_definitions_json"])
+        if not trait_def_path.exists():
+            logger.error(f"Trait definitions JSON not found: {trait_def_path.resolve()}")
+            raise FileNotFoundError(f"Trait definitions JSON not found: {trait_def_path.resolve()}")
+        trait_def = ImgTraitDefinition(trait_def_path)
+        if not trait_def.traits:
+             logger.error("Trait definitions loaded but resulted in an empty traits dictionary.")
+             raise ValueError("Trait definitions loaded but resulted in an empty traits dictionary.")
+        trait_names = list(trait_def.traits.keys())
+        logger.info(f"🧬 Loaded {len(trait_names)} traits: {', '.join(trait_names)}")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize trait definitions: {e}")
+        return
 
-    # --- Start processing ---
-    all_requests = []
-    total_models = len(all_models)
+    try:
+        checkpoint_file = settings["paths"].get("checkpoint_json")
+        orchestrator = Orchestrator(
+            trait_names=trait_names,
+            checkpoint_file=checkpoint_file,
+        )
+        logger.info("✅ Orchestrator initialized.")
+    except Exception as e:
+         logger.error(f"❌ Failed to initialize Orchestrator: {e}")
+         return
+
+
+    # --- Start processing PER MODEL ---
+    total_models = len(model_ids_to_process)
     total_questions = len(df)
-    total_ops = total_models * total_questions
-    current_op = 0
+    files_created = []
 
-    start_time = datetime.now()
-    logger.info("🕓 Beginning request generation...\n")
+    start_time_all = datetime.now()
+    logger.info(f"🕓 Beginning request generation at {start_time_all.strftime('%Y-%m-%d %H:%M:%S')}...\n")
 
-    for model_idx, model_id in enumerate(all_models.keys(), 1):
-        provider = get_provider_from_model_id(model_id)
-        logger.info(f"⚙️  [{model_idx}/{total_models}] Running model: {model_id} ({provider})")
+    for model_idx, model_id_alias in enumerate(model_ids_to_process, 1):
+        model_start_time = datetime.now()
+        logger.info(f"--- Processing Model {model_idx}/{total_models}: {model_id_alias} ---")
 
+        requests_for_this_model = []
+        try:
+            provider = get_provider_from_model_id(model_id_alias)
+            if provider == "openai" and not hasattr(orchestrator, 'openai_batch_service'):
+                 raise AttributeError("Orchestrator missing 'openai_batch_service'.")
+            if provider == "nebius" and not hasattr(orchestrator, 'nebius_batch_service'):
+                 raise AttributeError("Orchestrator missing 'nebius_batch_service'.")
+            if provider == "unknown":
+                logger.error(f"Skipping model {model_id_alias} due to unknown provider.")
+                continue
+
+        except (ValueError, AttributeError) as e:
+            logger.error(f"❌ Error setting up for model {model_id_alias}: {e}. Skipping model.")
+            continue
+
+        processed_questions_for_model = 0
         for i, (_, row) in enumerate(df.iterrows(), 1):
-            question = ScienceQA.from_df_row(row)
-            requests, _ = await orchestrator.prepare_batch_requests(question, provider, model_id)
+            try:
+                question = ScienceQA.from_df_row(row)
+                requests, image_file_ids_or_none = await orchestrator.prepare_batch_requests(
+                    question, provider, model_id_alias
+                )
+                requests_for_this_model.extend(requests)
+                processed_questions_for_model += 1
 
-            # Add temporary provider tag
-            for r in requests:
-                r["_provider"] = provider
+                if i % 20 == 0 or i == total_questions:
+                    elapsed_model = (datetime.now() - model_start_time).total_seconds()
+                    logger.info(f"    Processed {i}/{total_questions} questions for {model_id_alias} ({len(requests_for_this_model)} requests total) [{elapsed_model:.1f}s]")
 
-            all_requests.extend(requests)
-            current_op += 1
+            except Exception as e:
+                logger.error(f"    ❌ Error processing QID {row.get('question_id', 'N/A')} for model {model_id_alias}: {e}")
 
-            if i % 10 == 0 or i == len(df):
-                logger.info(f"   📈 {i}/{len(df)} questions processed for {model_id}")
+        model_end_time = datetime.now()
+        model_duration = (model_end_time - model_start_time).total_seconds()
+        logger.info(f"✅ Finished model {model_id_alias}. Generated {len(requests_for_this_model)} requests in {model_duration:.2f} seconds.")
 
-        logger.info(f"✅ Finished model {model_id} ({provider}) — total requests so far: {len(all_requests)}\n")
+        if requests_for_this_model:
+            cleaned_requests = clean_requests(requests_for_this_model)
+            base_path = Path(settings["paths"]["batch_request_file"])
+            timestamp = model_end_time.strftime("%Y%m%d_%H%M%S")
+            safe_model_alias = "".join(c if c.isalnum() else "_" for c in model_id_alias)
+            output_filename = f"{base_path.stem}_{safe_model_alias}_{timestamp}{base_path.suffix}"
+            # Ensure the output directory exists
+            output_dir = base_path.parent
+            output_dir.mkdir(parents=True, exist_ok=True) # Create dir if it doesn't exist
+            output_path = output_dir / output_filename
 
-    elapsed = (datetime.now() - start_time).total_seconds() / 60
-    logger.info(f"🧮 Request generation completed in {elapsed:.2f} min")
-    logger.info(f"📦 Total collected requests: {len(all_requests)}")
+            try:
+                batch_service = None
+                if provider == "openai":
+                    batch_service = orchestrator.openai_batch_service
+                elif provider == "nebius":
+                    batch_service = orchestrator.nebius_batch_service
 
-    # --- Split and clean requests ---
-    openai_reqs = clean_requests([r for r in all_requests if r.get("_provider") == "openai"])
-    nebius_reqs = clean_requests([r for r in all_requests if r.get("_provider") == "nebius"])
+                if batch_service:
+                    batch_service.write_jsonl_file(cleaned_requests, str(output_path))
+                    logger.info(f"💾 Batch file for {model_id_alias} saved -> {output_path.resolve()}")
+                    files_created.append(output_path.resolve())
+                else:
+                     logger.error(f"Could not find batch service for provider '{provider}' to write file.")
 
-    logger.info(f"📊 Split summary → OpenAI: {len(openai_reqs)} | Nebius: {len(nebius_reqs)}")
+            except Exception as e:
+                logger.error(f"❌ Failed to write batch file for model {model_id_alias} to {output_path}: {e}")
+        else:
+             logger.warning(f"⚠️ No requests generated for model {model_id_alias}, skipping file write.")
 
-    # --- Write JSONL batch files ---
-    base_path = Path(settings["paths"]["batch_request_file"])
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logger.info("-" * (len(f"--- Processing Model {model_idx}/{total_models}: {model_id_alias} ---")) + "\n")
 
-    if openai_reqs:
-        openai_path = base_path.with_name(f"{base_path.stem}_openai_{timestamp}{base_path.suffix}")
-        orchestrator.openai_batch_service.write_jsonl_file(openai_reqs, str(openai_path))
-        logger.info(f"💾 OpenAI batch saved → {openai_path.resolve()}")
 
-    if nebius_reqs:
-        nebius_path = base_path.with_name(f"{base_path.stem}_nebius_{timestamp}{base_path.suffix}")
-        orchestrator.nebius_batch_service.write_jsonl_file(nebius_reqs, str(nebius_path))
-        logger.info(f"💾 Nebius batch saved → {nebius_path.resolve()}")
+    # --- Summary after all models ---
+    end_time_all = datetime.now()
+    total_duration_minutes = (end_time_all - start_time_all).total_seconds() / 60
+    logger.info("="*50)
+    logger.info(f"🎉 All models processed in {total_duration_minutes:.2f} minutes.")
+    logger.info(f"📦 Generated {len(files_created)} batch file(s):")
+    if files_created:
+        for f_path in files_created:
+            logger.info(f"   -> {f_path.name}")
+    else:
+        logger.info("   (No files were generated)")
 
-    # --- Summary and next steps ---
-    logger.info("\n🎉 All model batches prepared successfully!")
-    logger.info("📍 Batch file locations:")
-    if openai_reqs:
-        logger.info(f"   • OpenAI → {openai_path.name}")
-    if nebius_reqs:
-        logger.info(f"   • Nebius → {nebius_path.name}")
-    logger.info("\n📤 To submit and monitor:")
-    logger.info("   python src/main.py --provider openai --batch --submit-batch --monitor")
-    logger.info("   python src/main.py --provider nebius --batch --submit-batch --monitor")
+    logger.info("\n📤 To submit batches (example for one file):")
+    if files_created:
+         example_path = files_created[0]
+         # Infer provider from filename part (assuming format like ..._ModelAlias_timestamp.suffix)
+         try:
+            stem = example_path.stem
+            prefix = "batch_request_file_"
+            suffix_start_index = -1
+            parts = stem.split("_")
+            # looking backwards for time and date
+            if len(parts) >= 3 and len(parts[-1]) == 6 and parts[-1].isdigit() and \
+                len(parts[-2]) == 8 and parts[-2].isdigit():
+                model_alias_in_filename = "_".join(parts[3:-2])
+            else:
+                model_alias_in_filename = "unknown_alias"
+                logger.warning(f"Could not reliably parse filename pattern '{example_path.name}' for example command.")
+
+            if model_alias_in_filename != "unknown_alias":
+                example_provider = get_provider_from_model_id(model_alias_in_filename)
+                logger.info(f"   python src/main.py --provider {example_provider} --batch-file \"{example_path.resolve()}\" --submit-batch --monitor")
+            else:
+                # If alias extraction failed, show generic command
+                 logger.info("   python src/main.py --provider [openai|nebius] --batch-file \"<YOUR_FILE_PATH>\" --submit-batch --monitor")
+
+         except Exception as e: # Catch any potential errors during parsing
+             logger.error(f"Error parsing filename '{example_path.name}' to generate example command: {e}")
+             logger.info("uv run python -m src.main --provider [openai|nebius] --batch-file \"<YOUR_FILE_PATH>\" --submit-batch --monitor")
+    else: # If no files created, still show generic command
+        logger.info("uv run python -m src.main --provider [openai|nebius] --batch-file \"<YOUR_FILE_PATH>\" --submit-batch --monitor")
+
     logger.info("\n✨ Done!")
 
 
 # ---------- ENTRY POINT ----------
 if __name__ == "__main__":
-    asyncio.run(run_all_models())
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate batch request files, one per model.")
+    parser.add_argument(
+        "-n", "--num-questions",
+        type=int,
+        default=100,
+        help="Number of questions to process (0 for all). Default: 100"
+    )
+    # Add log level argument
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO)."
+    )
+    args = parser.parse_args()
+
+    # --- Set logging level based on argument ---
+    log_level_numeric = getattr(logging, args.log_level.upper(), logging.INFO)
+    logger.setLevel(log_level_numeric) # Set level for our named logger
+    # Optionally set level for root logger if other modules log too
+    logging.getLogger().setLevel(log_level_numeric)
+    logger.info(f"Logging level set to {args.log_level.upper()}")
+
+
+    try:
+        asyncio.run(run_all_models(num_questions=args.num_questions))
+    except (RuntimeError, FileNotFoundError, ValueError, Exception) as e:
+        # --- FIXED: logger is now accessible here ---
+        logger.error(f"💥 An error occurred during execution: {e}", exc_info=True) # Add traceback
+        import sys
+        sys.exit(1) # Exit with error code
 
 --------------------------------------------------
 src/science_qa.py
@@ -3224,6 +3885,32 @@ class Statistics:
         if "validity" not in self.df.columns:
             raise ValueError("Input DataFrame must contain a 'validity' column.")
         self.df["validity"] = self.df["validity"].astype(bool)
+
+        # --- NEW: Standardize model_id from custom_id ---
+        # This overrides the model_id column with the alias from custom_id
+        # to fix any upstream overwrites (e.g., being set to model_reported).
+        if "custom_id" in self.df.columns:
+            print("Standardizing model_id from custom_id...")
+            # Regex: captures "L_Gemma327B" from "request-L_Gemma327B-..."
+            self.df["model_id"] = self.df["custom_id"].str.extract(
+                r"^request-([^-]+)-", expand=False
+            )
+            
+            # Optional: Standardize names for cleaner plot labels
+            # (You can customize this dictionary based on your needs)
+            replacements = {
+                "L_Gemma327B": "Gemma-3-27B",
+                "L_Qwen25VL72B": "Qwen2.5-VL-72B",
+                "gpt-5-mini": "GPT-5-Mini",
+                "gpt-4o-mini": "GPT-4o-Mini"
+            }
+            # Use .replace() to swap values, keep original if no match
+            self.df["model_id"] = self.df["model_id"].replace(replacements)
+            
+            print("Standardized Model IDs:", self.df["model_id"].unique())
+        else:
+            print("Warning: 'custom_id' column not found, using existing 'model_id'.")
+        # --- End of new section ---
 
         # --- Ground truth handling ---
         # Either use provided ground truth, auto-detect, or synthesize all-True labels.
@@ -3703,7 +4390,7 @@ class TraitAgent:
         self,
         question_data: ScienceQA,
         provider: str,
-        model_id: str,
+        model_id: str, 
         pil_images: Optional[List[Image.Image]] = None,
         image_file_ids: Optional[List[str]] = None,
     ):
@@ -3711,7 +4398,7 @@ class TraitAgent:
             qid = question_data.id
             if provider == "openai":
                 model = settings["models"]["openai"][model_id]
-                request_url = "/v1/responses"
+                request_url = "/v1/responses" 
             elif provider == "nebius":
                 model = settings["models"]["nebius"][model_id]
                 request_url = "/v1/chat/completions"
@@ -3737,12 +4424,10 @@ class TraitAgent:
 
             # Different payload based on provider
             if provider == "openai":
-                # OpenAI uses Responses API format
+                # OpenAI uses Responses API format (as requested)
                 payload = {
                     "model": model,
                     "instructions": self.system_prompt,
-                    "temperature": 0,
-                    "top_p": 1,
                     "max_output_tokens": max_out,
                     "input": inputs,
                     "text": {
@@ -3754,12 +4439,15 @@ class TraitAgent:
                         },
                     },
                 }
+                
+                # GPT5 does not take temperature or top_p parameters in the payload
+                if not model_id.startswith("GPT5"):
+                    payload["temperature"] = 0
+                    payload["top_p"] = 1
+
             else:  # nebius
-                # Nebius uses Chat Completions format
-                # Convert inputs to messages array
                 messages = [{"role": "system", "content": self.system_prompt}]
 
-                # Add user messages from inputs
                 for msg in inputs:
                     if msg.get("role") == "user":
                         messages.append(msg)
@@ -3776,9 +4464,12 @@ class TraitAgent:
                         },
                     },
                     "max_tokens": max_out,
-                    "temperature": 0,
-                    "top_p": 1,
                 }
+
+
+                if not model_id.startswith("GPT5"):
+                    payload["temperature"] = 0
+                    payload["top_p"] = 1
 
             request_text = {
                 "custom_id": request_id,
