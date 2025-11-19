@@ -10,9 +10,9 @@ from src.config import settings
 from src.img_traits_def import ImgTraitDefinition
 from src.prompt_template import combi_system_prompt_template
 from src.science_qa import ScienceQA, build_question, build_characteristics
-from src_orig.orig_traits_def import OriginalTraitDefinition
 from src.llm_service.config import ConfigManager
-from src.llm_service.schemas import ValidationListSchema
+from src.llm_service.schemas import ValidationListSchema, NebiusValidationListSchema
+
 
 
 logger = logging.getLogger(__name__)
@@ -179,7 +179,7 @@ class CombinedTraitsBuilder:
                     payload["top_p"] = 1
 
             else:  # nebius
-                schema = ValidationListSchema.model_json_schema()
+                schema = NebiusValidationListSchema.model_json_schema()                
                 messages = [{"role": "system", "content": self.system_prompt}]
 
                 for msg in inputs:

@@ -92,3 +92,15 @@ class ValidationListSchema(BaseModel):
         return schema
 
 
+class NebiusTraitEvaluation(BaseModel):
+    """Simplified schema that fits all results into one shape."""
+    model_config = {"extra": "forbid"}
+
+    trait: str = Field(..., description="The name of the trait.")
+    validity: bool = Field(..., description="True if valid, False if invalid.")
+    reasoning: str = Field(..., description="Explanation if invalid, empty string if valid.")
+
+class NebiusValidationListSchema(BaseModel):
+    """Compatible Schema for Nebius (Flat properties)"""
+    model_config = {"extra": "forbid"}
+    traits_output: List[NebiusTraitEvaluation] = Field(..., description="List of validations.")
