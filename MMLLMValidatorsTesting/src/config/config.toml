@@ -9,7 +9,7 @@
 # Base directory for the ScienceQA image dataset
 image_base_dir = "data/ScienceQA_images/test"
 # Path to the main input data CSV
-input_data_csv = "data/ScienceQA_test_mc_images.csv"
+input_data_csv = "data/ScienceQA_test_scrambled.csv" # testing on the scrambled data
 # Directory to save output results
 results_dir = "data/comparison_results/"
 # Path to the JSON file containing trait definitions and examples

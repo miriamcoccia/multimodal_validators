@@ -24,8 +24,10 @@ logger = logging.getLogger("process_all")
 
 def process_all_batches():
     # 1. Define Directories
-    input_root = PROJECT_ROOT / "data" / "batch_results"
-    output_root = PROJECT_ROOT / "data" / "processed_results"
+    # input_root = PROJECT_ROOT / "data" / "batch_results"
+    # output_root = PROJECT_ROOT / "data" / "processed_results"
+    input_root = PROJECT_ROOT / "data" / "scrambled_results"
+    output_root = PROJECT_ROOT / "data" / "scrambled_processed"
 
     if not input_root.exists():
         logger.error(f"❌ Input directory not found: {input_root}")
