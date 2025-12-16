@@ -10,6 +10,8 @@
 image_base_dir = "data/ScienceQA_images/test"
 # Path to the main input data CSV
 input_data_csv = "data/ScienceQA_test_scrambled.csv" # testing on the scrambled data
+# input_data_csv = "data/ScienceQA_test_mc_images.csv" 
+
 # Directory to save output results
 results_dir = "data/comparison_results/"
 # Path to the JSON file containing trait definitions and examples
@@ -39,7 +41,7 @@ choice_options = ["A", "B", "C", "D", "E"]
 # =============================================================================
 [defaults]
 # Default models to use as fallbacks in the MultimodalLLM_Service
-openai_multimodal_default = "GPT4oMini"
+openai_multimodal_default = "GPT5Nano"
 nebius_multimodal_default = "L_Gemma327B"
 
 

@@ -3,6 +3,152 @@ src/__init__.py
 --------------------------------------------------
 
 --------------------------------------------------
+src/check_errors.py
+--------------------------------------------------
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# 1. Load secrets
+load_dotenv("secrets.env")
+
+# 2. Initialize Client
+try:
+    client = OpenAI()
+except Exception as e:
+    print(f"❌ Error initializing client: {e}")
+    exit(1)
+
+# 3. The 5 Failed Batch IDs
+failed_batches = [
+"batch_6930304b707c81908ea5b2485a2681b3", # GPT5Mini (Single)
+    "batch_6930308b8e5081908ab2503196974723", # GPT5Nano (Single)
+    "batch_693030a38f5c8190bd4eb92b703af9f0", # GPT5Nano (Combined)
+    "batch_693030e7e3a48190a9a014d54ca37402", # GPT4oMini (Single)
+    "batch_6930310299988190b243c21e2ab67c7c"
+]
+
+print(f"🔍 Checking {len(failed_batches)} failed batches...\n")
+
+for batch_id in failed_batches:
+    try:
+        batch = client.batches.retrieve(batch_id)
+        print(f"🆔 ID: {batch_id}")
+        
+        if batch.errors:
+            print("❌ ERRORS FOUND:")
+            # PRINT RAW DATA to avoid attribute errors
+            print(f"   {batch.errors}")
+        else:
+            print(f"❓ Status: {batch.status}")
+            
+        print("-" * 40)
+
+    except Exception as e:
+        print(f"❌ Critical failure checking {batch_id}: {e}")
+
+--------------------------------------------------
+src/cleanup_openai.py
+--------------------------------------------------
+import os
+import time
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# 1. Setup
+load_dotenv("secrets.env")
+
+try:
+    client = OpenAI()
+except Exception as e:
+    print(f"❌ Error initializing client: {e}")
+    exit(1)
+
+def cleanup():
+    print("🧹 STARTING OPENAI CLEANUP...")
+    print("--------------------------------------------------")
+    
+    # --- STEP 1: Cancel Active Batches ---
+    print("\n1️⃣  Checking for Active/Pending Batches...")
+    try:
+        # Get recent batches (limit 100)
+        batches = client.batches.list(limit=100)
+        count_cancelled = 0
+        
+        for batch in batches:
+            # We only need to cancel unfinished ones
+            if batch.status in ['validating', 'in_progress', 'finalizing']:
+                print(f"   🚫 Cancelling batch {batch.id} (Status: {batch.status})...")
+                try:
+                    client.batches.cancel(batch.id)
+                    count_cancelled += 1
+                except Exception as e:
+                    print(f"      Could not cancel {batch.id}: {e}")
+            else:
+                # We can't "delete" the history record of a completed/failed batch 
+                # via API, but we will delete its files in Step 2.
+                pass
+        
+        if count_cancelled == 0:
+            print("   ✅ No active batches found to cancel.")
+        else:
+            print(f"   ⚠️ Cancelled {count_cancelled} active batches.")
+
+    except Exception as e:
+        print(f"   ❌ Error listing batches: {e}")
+
+    # --- STEP 2: Delete Batch Files (Keep Images) ---
+    print("\n2️⃣  Cleaning up Files (Keeping Images)...")
+    
+    try:
+        files = client.files.list()
+        deleted_count = 0
+        kept_count = 0
+        
+        # Extensions to PROTECT
+        image_exts = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff')
+
+        for file in files:
+            # SAFETY CHECK: Is it an image?
+            if file.filename.lower().endswith(image_exts):
+                print(f"   🛡️  Keeping Image: {file.filename}")
+                kept_count += 1
+                continue
+            
+            # If it's not an image, delete it (mostly .jsonl batch files)
+            try:
+                # Optional: Filter strictly for batch purpose if you have other non-image files
+                # if file.purpose in ['batch', 'batch_output']:
+                
+                print(f"   🗑️  Deleting: {file.filename} (ID: {file.id})")
+                client.files.delete(file.id)
+                deleted_count += 1
+                
+                # Sleep briefly to avoid rate limits if you have hundreds
+                time.sleep(0.1) 
+                
+            except Exception as e:
+                print(f"      ❌ Failed to delete {file.filename}: {e}")
+
+        print("--------------------------------------------------")
+        print(f"✨ Cleanup Summary:")
+        print(f"   🛡️  Images Preserved: {kept_count}")
+        print(f"   🗑️  Junk Files Deleted: {deleted_count}")
+
+    except Exception as e:
+        print(f"   ❌ Error listing files: {e}")
+
+if __name__ == "__main__":
+    print("⚠️  DANGER ZONE ⚠️")
+    print("This will cancel ALL active batches and delete ALL non-image files (e.g., .jsonl).")
+    confirm = input("Are you sure you want to proceed? (yes/no): ")
+    
+    if confirm.lower() == "yes":
+        cleanup()
+    else:
+        print("❌ Operation cancelled.")
+
+--------------------------------------------------
 src/combine_results.py
 --------------------------------------------------
 #!/usr/bin/env python3
@@ -2743,8 +2889,10 @@ logger = logging.getLogger("process_all")
 
 def process_all_batches():
     # 1. Define Directories
-    input_root = PROJECT_ROOT / "data" / "batch_results"
-    output_root = PROJECT_ROOT / "data" / "processed_results"
+    # input_root = PROJECT_ROOT / "data" / "batch_results"
+    # output_root = PROJECT_ROOT / "data" / "processed_results"
+    input_root = PROJECT_ROOT / "data" / "scrambled_results"
+    output_root = PROJECT_ROOT / "data" / "scrambled_processed"
 
     if not input_root.exists():
         logger.error(f"❌ Input directory not found: {input_root}")
@@ -2899,6 +3047,177 @@ The final output structure MUST look like:
 }}
 """.strip()
 
+
+--------------------------------------------------
+src/resubmit_and_monitor.py
+--------------------------------------------------
+#!/usr/bin/env python3
+import asyncio
+import logging
+import glob
+import os
+from pathlib import Path
+from src.config import settings, PROJECT_ROOT
+from src.llm_service.service import OpenAIBatchService
+from src.llm_service.providers.basic_batch import BaseBatchService
+
+# --- Setup Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("resubmit_tool")
+
+# --- Reusing Your Monitoring Logic ---
+async def monitor_batch_progress(
+    batch_id: str,
+    batch_service: BaseBatchService,
+    check_interval: int,
+    model_id: str,
+    provider: str,
+    strategy: str,
+):
+    """
+    Monitors status and downloads results to the standard project path.
+    """
+    logger.info(f"👀 Monitoring batch {batch_id} for {model_id} ({strategy})...")
+
+    while True:
+        try:
+            status = batch_service.get_batch_status(batch_id)
+            batch_status = status.get("status", "unknown")
+
+            if batch_status == "completed":
+                logger.info(f"🎉 Batch {batch_id} completed!")
+
+                output_file_id = status.get("output_file_id")
+                if not output_file_id:
+                    logger.error(f"❌ Batch {batch_id} has no output_file_id.")
+                else:
+                    # Construct standard path
+                    safe_model = "".join(c if c.isalnum() else "_" for c in model_id)
+                    output_dir = (
+                        PROJECT_ROOT
+                        / "data"
+                        / "batch_results"
+                        / provider
+                        / safe_model
+                        / strategy
+                    )
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+                    output_filename = f"results_{batch_id}_{output_file_id}.jsonl"
+                    output_path = output_dir / output_filename
+
+                    logger.info(f"📥 Downloading to {output_path}...")
+                    
+                    # Run the blocking download in a thread to keep async loop alive
+                    success = await asyncio.to_thread(
+                        batch_service.download_batch_results, batch_id, str(output_path)
+                    )
+                    
+                    if success:
+                        logger.info(f"✅ Saved: {output_path.name}")
+                    else:
+                        logger.warning(f"⚠️ Download failed for {batch_id}.")
+
+                return True
+
+            elif batch_status == "failed":
+                logger.error(f"❌ Batch {batch_id} failed!")
+                # Try to print error reason
+                if status.get("errors"):
+                     logger.error(f"Reason: {status.get('errors')}")
+                return False
+
+            elif batch_status == "in_progress":
+                # Only log progress occasionally to reduce noise
+                counts = status.get("request_counts", {})
+                logger.debug(f"⏳ {model_id}: {counts}")
+
+            await asyncio.sleep(check_interval)
+
+        except Exception as e:
+            logger.error(f"Error checking batch {batch_id}: {e}")
+            await asyncio.sleep(check_interval)
+
+# --- Main Resubmission Logic ---
+async def main():
+    service = OpenAIBatchService()
+    batch_dir = Path(settings["paths"]["batch_request_file"]).parent
+    
+    # Map the failed targets to their specific details
+    # (Provider is assumed OpenAI since that's what failed)
+    failed_targets = [
+        {"model": "GPT5Mini", "strategy": "single"},
+        {"model": "GPT5Nano", "strategy": "single"},
+        {"model": "GPT5Nano", "strategy": "combined"},
+        {"model": "GPT4oMini", "strategy": "single"},
+        {"model": "GPT4oMini", "strategy": "combined"},
+    ]
+
+    tasks = []
+
+    print(f"📂 Scanning {batch_dir} for failed files...")
+
+    for target in failed_targets:
+        model = target["model"]
+        strategy = target["strategy"]
+        
+        # specific pattern to match how files were named in run_all_models
+        # e.g. *openai_GPT5Nano_single*
+        pattern = str(batch_dir / f"*openai_{model}_{strategy}*.jsonl")
+        matching_files = glob.glob(pattern)
+
+        if not matching_files:
+            logger.warning(f"⚠️  No file found for {model} {strategy}")
+            continue
+
+        # Get latest file
+        latest_file = max(matching_files, key=os.path.getmtime)
+        filename = os.path.basename(latest_file)
+        
+        logger.info(f"🚀 Resubmitting: {filename}")
+
+        try:
+            # Run blocking submit in thread
+            batch_id = await asyncio.to_thread(
+                service.submit_batch, latest_file, f"Resubmit_{model}_{strategy}"
+            )
+
+            if batch_id:
+                logger.info(f"   ✅ Submitted {model} ({strategy}) -> ID: {batch_id}")
+                
+                # Create monitoring task
+                task = asyncio.create_task(
+                    monitor_batch_progress(
+                        batch_id=batch_id,
+                        batch_service=service,
+                        check_interval=60, # Check every 1 minute
+                        model_id=model,
+                        provider="openai",
+                        strategy=strategy
+                    )
+                )
+                tasks.append(task)
+            else:
+                logger.error(f"   ❌ Failed to get Batch ID for {filename}")
+
+        except Exception as e:
+            logger.error(f"   ❌ Exception submitting {filename}: {e}")
+
+    if tasks:
+        logger.info(f"\n👀 Monitoring {len(tasks)} batches in parallel. Do not close this terminal.\n")
+        await asyncio.gather(*tasks)
+    else:
+        logger.info("No batches were submitted.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("\n🛑 Process stopped by user.")
 
 --------------------------------------------------
 src/results_handler.py
@@ -3993,6 +4312,372 @@ def build_activity_components(problem: ScienceQA) -> str:
 - solution: {ans_label}
 {extra_block if extra_block else ""}"""
     ).strip()
+
+--------------------------------------------------
+src/split_and_submit.py
+--------------------------------------------------
+#!/usr/bin/env python3
+import asyncio
+import logging
+import glob
+import os
+import time
+from pathlib import Path
+from math import ceil
+from src.config import settings, PROJECT_ROOT
+from src.llm_service.service import OpenAIBatchService
+
+# --- Setup Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("sequential_submit")
+
+# --- Constants ---
+CHUNK_SIZE = 400
+
+async def process_one_batch(service, filepath, model, strategy, part_num):
+    """Submits one batch and waits until it is completely finished."""
+    
+    filename = os.path.basename(filepath)
+    batch_tag = f"Seq_{model}_{strategy}_p{part_num}"
+    
+    logger.info(f"\n🚀 STARTING PART {part_num}: {filename}")
+
+    # 1. Submit
+    try:
+        batch_id = await asyncio.to_thread(
+            service.submit_batch, str(filepath), batch_tag
+        )
+        if not batch_id:
+            logger.error("   ❌ Submission failed (no ID returned).")
+            return False
+            
+        logger.info(f"   ✅ Submitted -> ID: {batch_id}")
+        logger.info("   ⏳ Waiting for completion (this keeps the queue clear)...")
+
+    except Exception as e:
+        logger.error(f"   ❌ Submission error: {e}")
+        return False
+
+    # 2. Monitor until done (Blocking)
+    while True:
+        try:
+            status = service.get_batch_status(batch_id)
+            state = status.get("status", "unknown")
+            
+            if state == "completed":
+                logger.info(f"   🎉 Part {part_num} COMPLETED!")
+                
+                # Download
+                output_file_id = status.get("output_file_id")
+                if output_file_id:
+                    safe_model = "".join(c if c.isalnum() else "_" for c in model)
+                    output_dir = (
+                        PROJECT_ROOT / "data" / "batch_results" / "openai" / safe_model / strategy
+                    )
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    output_path = output_dir / f"results_part{part_num}_{batch_id}.jsonl"
+                    
+                    await asyncio.to_thread(
+                        service.download_batch_results, batch_id, str(output_path)
+                    )
+                    logger.info(f"   📥 Downloaded results to: {output_path.name}")
+                return True
+
+            elif state == "failed":
+                errs = status.get("errors", "Unknown error")
+                logger.error(f"   ❌ Part {part_num} FAILED. Reason: {errs}")
+                return False
+
+            elif state in ["validating", "in_progress", "finalizing"]:
+                # Wait 30 seconds before checking again
+                await asyncio.sleep(30)
+            
+            else:
+                await asyncio.sleep(10)
+
+        except Exception as e:
+            logger.error(f"   ⚠️ Monitor error: {e}")
+            await asyncio.sleep(30)
+
+async def main():
+    service = OpenAIBatchService()
+    batch_dir = Path(settings["paths"]["batch_request_file"]).parent
+    
+    # 1. Define Targets
+    targets = [
+        {"model": "GPT5Mini", "strategy": "single"},
+        {"model": "GPT5Nano", "strategy": "single"},
+        {"model": "GPT5Nano", "strategy": "combined"},
+        {"model": "GPT4oMini", "strategy": "single"},
+        {"model": "GPT4oMini", "strategy": "combined"},
+    ]
+
+    # 2. Loop through targets
+    for target in targets:
+        model = target["model"]
+        strategy = target["strategy"]
+        
+        # Find the original large file
+        pattern = str(batch_dir / f"*openai_{model}_{strategy}*.jsonl")
+        matching_files = glob.glob(pattern)
+        
+        # Filter out files that already include "_part" to avoid re-splitting splits
+        original_files = [f for f in matching_files if "_part" not in f]
+
+        if not original_files:
+            continue
+
+        latest_file = max(original_files, key=os.path.getmtime)
+        logger.info(f"\n📦 Processing Group: {model} ({strategy})")
+
+        # 3. Read and Split
+        with open(latest_file, 'r') as f:
+            lines = f.readlines()
+        
+        if not lines: continue
+        
+        num_chunks = ceil(len(lines) / CHUNK_SIZE)
+        
+        # 4. Process Chunks Sequentially
+        for i in range(num_chunks):
+            part_num = i + 1
+            
+            # Create/Check Part File
+            original_path = Path(latest_file)
+            part_filename = f"{original_path.stem}_part{part_num}{original_path.suffix}"
+            part_path = original_path.parent / part_filename
+            
+            # Write if missing
+            if not part_path.exists():
+                with open(part_path, 'w') as out_f:
+                    out_f.writelines(lines[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE])
+            
+            # CHECK IF DONE: Look for result file to skip
+            safe_model = "".join(c if c.isalnum() else "_" for c in model)
+            result_dir = PROJECT_ROOT / "data" / "batch_results" / "openai" / safe_model / strategy
+            # Simple check if any result file exists for this part
+            existing_results = glob.glob(str(result_dir / f"results_part{part_num}_*.jsonl"))
+            
+            if existing_results:
+                logger.info(f"   ⏩ Part {part_num} already done. Skipping.")
+                continue
+
+            # RUN BATCH
+            success = await process_one_batch(service, part_path, model, strategy, part_num)
+            
+            if not success:
+                logger.error("   🛑 Stopping sequence due to failure.")
+                break # Stop this model if a part fails
+            
+            # Small cooldown
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("\n🛑 Stopped by user.")
+    # Locate the folder where your request files live
+    
+   
+
+--------------------------------------------------
+src/stat_test.py
+--------------------------------------------------
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+from statsmodels.stats.contingency_tables import mcnemar
+import os
+
+# ⚙️ CONFIGURATION
+PATH_SCRAMBLED = "/Users/miriam/projects/multimodal_validators/MMLLMValidatorsTesting/data/scrambled_processed"
+PATH_CLEAN     = "/Users/miriam/projects/multimodal_validators/MMLLMValidatorsTesting/data/processed_results"
+OUTPUT_CSV     = "evaluation_analysis.csv"
+OUTPUT_PLOT    = "evaluation_plot.png"
+
+def get_dataset_stats(root_path, dataset_type):
+    """
+    Returns a list of dictionaries with stats for the given dataset.
+    dataset_type: 'clean' (Accuracy) or 'scrambled' (Rejection Rate)
+    """
+    root = Path(root_path)
+    stats_list = []
+    
+    if not root.exists():
+        print(f"⚠️ Warning: Path not found for {dataset_type}: {root}")
+        return []
+
+    # Target Validity: Clean wants 'True', Scrambled wants 'False' (Error Detection)
+    target_validity = 'true' if dataset_type == 'clean' else 'false'
+    metric_name = "Accuracy" if dataset_type == 'clean' else "Error Detection Rate"
+
+    # Find directories
+    model_dirs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if 'single' in dirnames and 'combined' in dirnames:
+            model_dirs.append(Path(dirpath))
+
+    for model_dir in model_dirs:
+        try:
+            # Locate CSVs
+            path_s = next((model_dir / "single").rglob("clean_evaluation_results.csv"))
+            path_c = next((model_dir / "combined").rglob("clean_evaluation_results.csv"))
+            
+            # Load
+            df_s = pd.read_csv(path_s)
+            df_c = pd.read_csv(path_c)
+            
+            # Calculate Success
+            df_s['success'] = df_s['validity'].astype(str).str.lower() == target_validity
+            df_c['success'] = df_c['validity'].astype(str).str.lower() == target_validity
+            
+            # Merge
+            merged = pd.merge(
+                df_s[['question_id', 'trait', 'success']],
+                df_c[['question_id', 'trait', 'success']],
+                on=['question_id', 'trait'],
+                suffixes=('_s', '_c')
+            )
+            
+            if len(merged) == 0: continue
+
+            # McNemar
+            s_wins = len(merged[(merged['success_s']) & (~merged['success_c'])])
+            c_wins = len(merged[(~merged['success_s']) & (merged['success_c'])])
+            table = [[0, s_wins], [c_wins, 0]]
+            p_val = mcnemar(table, exact=True).pvalue
+            
+            # Logic
+            single_perf = merged['success_s'].mean()
+            combined_perf = merged['success_c'].mean()
+            delta = single_perf - combined_perf
+            
+            if p_val < 0.05:
+                winner = "SINGLE" if delta > 0 else "COMBINED"
+            else:
+                winner = "TIE"
+
+            stats_list.append({
+                "Dataset": dataset_type.title(),
+                "Model": model_dir.name,
+                "Provider": model_dir.parent.name,
+                "Metric": metric_name,
+                "Single_Score": single_perf,
+                "Combined_Score": combined_perf,
+                "Delta": delta,
+                "P_Value": p_val,
+                "Winner": winner
+            })
+
+        except Exception:
+            continue
+
+    return stats_list
+
+def plot_results(df):
+    """Generates a professional side-by-side bar chart."""
+    models = df['Model'].unique()
+    models.sort()
+    
+    # Setup Figure
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7), sharey=True)
+    plt.subplots_adjust(wspace=0.1)
+    
+    metrics = {
+        'Clean': ('Accuracy (Validating Truth)', axes[1]),
+        'Scrambled': ('Rejection Rate (Detecting Errors)', axes[0])
+    }
+    
+    # Color Scheme (Blue vs Orange)
+    c_single = '#4C72B0'
+    c_combined = '#DD8452'
+
+    for ds_type, (title, ax) in metrics.items():
+        subset = df[df['Dataset'] == ds_type].sort_values('Model')
+        if subset.empty: continue
+        
+        x = np.arange(len(subset))
+        width = 0.35
+        
+        # Bars
+        rects1 = ax.bar(x - width/2, subset['Single_Score'], width, label='Single', color=c_single)
+        rects2 = ax.bar(x + width/2, subset['Combined_Score'], width, label='Combined', color=c_combined)
+        
+        # Formatting
+        ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
+        ax.set_xticks(x)
+        ax.set_xticklabels(subset['Model'], rotation=45, ha='right')
+        ax.set_ylim(0, 1.05)
+        ax.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # Add labels on top of bars
+        def autolabel(rects):
+            for rect in rects:
+                height = rect.get_height()
+                ax.annotate(f'{height:.1%}',
+                            xy=(rect.get_x() + rect.get_width() / 2, height),
+                            xytext=(0, 3),  # 3 points vertical offset
+                            textcoords="offset points",
+                            ha='center', va='bottom', fontsize=9)
+        
+        autolabel(rects1)
+        autolabel(rects2)
+
+        # Highlight Winner
+        for i, row in enumerate(subset.itertuples()):
+            if row.Winner != "TIE":
+                # Add star above the winner
+                target_x = x[i] - width/2 if row.Winner == "SINGLE" else x[i] + width/2
+                target_h = row.Single_Score if row.Winner == "SINGLE" else row.Combined_Score
+                ax.text(target_x, target_h + 0.05, "★", ha='center', color='black', fontsize=14)
+
+    # Global Labels
+    axes[0].set_ylabel('Score', fontsize=12)
+    axes[1].legend(
+    loc='upper left',           
+    bbox_to_anchor=(1.05, 1),   
+    title="Prompt Mode",
+    borderaxespad=0.
+)
+    
+    plt.suptitle('LLM Performance: Single vs Combined Prompts', fontsize=16, y=1.02)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_PLOT, bbox_inches='tight', dpi=300)
+    print(f"📊 Plot saved to: {OUTPUT_PLOT}")
+
+def main():
+    print("🚀 Processing Datasets...")
+    
+    # 1. Gather Data
+    data_scrambled = get_dataset_stats(PATH_SCRAMBLED, 'scrambled')
+    data_clean = get_dataset_stats(PATH_CLEAN, 'clean')
+    
+    full_data = data_scrambled + data_clean
+    
+    if not full_data:
+        print("❌ No data found. Check paths.")
+        return
+
+    # 2. Create DataFrame
+    df = pd.DataFrame(full_data)
+    
+    # 3. Save CSV
+    # Reorder columns for readability
+    cols = ['Dataset', 'Model', 'Provider', 'Metric', 'Single_Score', 'Combined_Score', 'Delta', 'P_Value', 'Winner']
+    df[cols].to_csv(OUTPUT_CSV, index=False)
+    print(f"💾 CSV saved to:  {OUTPUT_CSV}")
+
+    # 4. Plot
+    plot_results(df)
+
+if __name__ == "__main__":
+    main()
 
 --------------------------------------------------
 src/stats.py

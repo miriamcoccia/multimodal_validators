@@ -99,7 +99,6 @@ async def monitor_batch_progress(
     batch_id: str,
     batch_service: BaseBatchService,
     check_interval: int,
-    # ✅ Added metadata for download path
     model_id: str,
     provider: str,
     strategy: str,
