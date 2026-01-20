@@ -1,4 +1,121 @@
 --------------------------------------------------
+nebius_rescue.py
+--------------------------------------------------
+import os
+import glob
+import requests
+import time
+import shutil
+from dotenv import load_dotenv
+
+# --- Initialize Environment ---
+# Assuming secrets.env is in MMLLMValidatorsTesting/
+load_dotenv("secrets.env")
+NEBIUS_API_KEY = os.getenv("NEBIUS_API_KEY")
+NEBIUS_BASE_URL = "https://api.studio.nebius.ai/v1"
+
+# --- Precise Path Configuration ---
+BASE_DIR = "/Users/miriam/projects/multimodal_validators/MMLLMValidatorsTesting"
+DATA_DIR = os.path.join(BASE_DIR, "data")
+# Look inside the data/ folder for the nebius single files
+TARGET_PATTERN = os.path.join(DATA_DIR, "*nebius*single*.jsonl")
+LOG_FILE = os.path.join(BASE_DIR, "submitted_batches_log.txt")
+PROCESSED_DIR = os.path.join(DATA_DIR, "processed_originals")
+
+CHUNK_SIZE_MB = 90 
+
+def log_status(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {message}\n")
+    print(message)
+
+def split_large_file(input_path):
+    # Get just the name without the .jsonl extension
+    file_name_only = os.path.splitext(os.path.basename(input_path))[0]
+    max_bytes = CHUNK_SIZE_MB * 1024 * 1024
+    chunks = []
+    file_num = 1
+    
+    with open(input_path, 'r', encoding='utf-8') as f:
+        lines, curr_size = [], 0
+        for line in f:
+            line_bytes = len(line.encode('utf-8'))
+            if curr_size + line_bytes > max_bytes:
+                # Save chunks in the data folder
+                chunk_name = os.path.join(DATA_DIR, f"{file_name_only}_chunk_{file_num:03d}.jsonl")
+                with open(chunk_name, 'w', encoding='utf-8') as cf:
+                    cf.writelines(lines)
+                chunks.append(chunk_name)
+                file_num += 1
+                lines, curr_size = [], 0
+            lines.append(line)
+            curr_size += line_bytes
+        if lines:
+            chunk_name = os.path.join(DATA_DIR, f"{file_name_only}_chunk_{file_num:03d}.jsonl")
+            with open(chunk_name, 'w', encoding='utf-8') as cf:
+                cf.writelines(lines)
+            chunks.append(chunk_name)
+    return chunks
+
+def submit_to_nebius(file_path):
+    headers = {"Authorization": f"Bearer {NEBIUS_API_KEY}"}
+    try:
+        with open(file_path, 'rb') as f:
+            r = requests.post(f"{NEBIUS_BASE_URL}/files", headers=headers, 
+                              files={"file": f}, data={"purpose": "batch"}, timeout=300)
+        r.raise_for_status()
+        file_id = r.json().get('id')
+        
+        payload = {"input_file_id": file_id, "endpoint": "/v1/chat/completions", "completion_window": "24h"}
+        r = requests.post(f"{NEBIUS_BASE_URL}/batches", headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json().get('id')
+    except Exception as e:
+        return f"Error: {e}"
+
+def run_rescue():
+    if not NEBIUS_API_KEY:
+        log_status("❌ CRITICAL: NEBIUS_API_KEY missing from secrets.env")
+        return
+
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    
+    # glob will now look specifically in /data/
+    files_to_fix = [f for f in glob.glob(TARGET_PATTERN) if "_chunk_" not in f]
+
+    if not files_to_fix:
+        log_status(f"✅ No nebius_single files found in {DATA_DIR}")
+        return
+
+    log_status(f"🚀 Rescue started for {len(files_to_fix)} files.")
+
+    for big_file in files_to_fix:
+        log_status(f"📂 Processing: {os.path.basename(big_file)}")
+        chunks = split_large_file(big_file)
+        
+        success_count = 0
+        for i, chunk in enumerate(chunks, 1):
+            batch_id = submit_to_nebius(chunk)
+            if "Error" in str(batch_id):
+                log_status(f"   ❌ Part {i} Failed: {batch_id}")
+            else:
+                log_status(f"   ✅ Part {i} Launched: {batch_id}")
+                success_count += 1
+                os.remove(chunk)
+
+        if success_count == len(chunks):
+            # Move the big 1.36GB file to the processed folder
+            dest = os.path.join(PROCESSED_DIR, os.path.basename(big_file))
+            shutil.move(big_file, dest)
+            log_status(f"📦 Moved original to {PROCESSED_DIR}")
+
+    log_status("✨ All done. You can safely close your terminal.")
+
+if __name__ == "__main__":
+    run_rescue()
+
+--------------------------------------------------
 src/__init__.py
 --------------------------------------------------
 
@@ -147,6 +264,79 @@ if __name__ == "__main__":
         cleanup()
     else:
         print("❌ Operation cancelled.")
+
+--------------------------------------------------
+src/combine_master_results.py
+--------------------------------------------------
+import logging
+import pandas as pd
+from pathlib import Path
+from src.config import PROJECT_ROOT
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+logger = logging.getLogger("combiner")
+
+def combine_results():
+    # 1. Path Setup
+    processed_root = PROJECT_ROOT / "data" / "normal_processed_FINAL"
+    master_root = PROJECT_ROOT / "data" / "normal_master_results_FINAL"
+    
+    if not processed_root.exists():
+        logger.error(f"❌ Folder not found: {processed_root}")
+        return
+
+    # 2. Find all processed parts
+    all_clean_csvs = list(processed_root.rglob("clean_evaluation_results.csv"))
+    
+    if not all_clean_csvs:
+        logger.warning("⚠️ No processed CSVs found. Run process_all_results first.")
+        return
+
+    # 3. Group by Model and Strategy
+    # Structure: data/normal_processed/{provider}/{model}/{strategy}/{part_folder}/file
+    groups = {}
+    for csv_path in all_clean_csvs:
+        # Get components relative to the root
+        rel = csv_path.relative_to(processed_root)
+        parts = rel.parts
+        
+        if len(parts) < 4:
+            continue
+            
+        provider, model, strategy = parts[0], parts[1], parts[2]
+        key = (provider, model, strategy)
+        
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(csv_path)
+
+    logger.info(f"🚀 Found {len(groups)} Model/Strategy combinations.")
+
+    # 4. Merge and Save
+    for (provider, model, strategy), paths in groups.items():
+        logger.info(f"📦 Merging {len(paths)} parts for {model} ({strategy})...")
+        
+        try:
+            # Combine all parts into one table
+            dfs = [pd.read_csv(p) for p in paths]
+            master_df = pd.concat(dfs, ignore_index=True)
+            
+            # Save to Master Results folder
+            master_root.mkdir(parents=True, exist_ok=True)
+            filename = f"{provider}_{model}_{strategy}_MASTER.csv"
+            output_path = master_root / filename
+            
+            master_df.to_csv(output_path, index=False)
+            logger.info(f"   ✅ Saved {len(master_df)} rows to: {output_path.name}")
+            
+        except Exception as e:
+            logger.error(f"   ❌ Failed to combine {model} {strategy}: {e}")
+
+    logger.info(f"\n✨ All master files generated in: {master_root}")
+
+if __name__ == "__main__":
+    combine_results()
 
 --------------------------------------------------
 src/combine_results.py
@@ -903,6 +1093,116 @@ if __name__ == "__main__":
     #     'utils/helpers.py'
     # ]
     # combine_specific_files(files_to_combine, 'project.txt')
+
+--------------------------------------------------
+src/fire_and_forget.py
+--------------------------------------------------
+import os
+import glob
+import asyncio
+import time
+from pathlib import Path
+from math import ceil
+from datetime import datetime
+from src.config import settings, PROJECT_ROOT
+from src.llm_service.service import OpenAIBatchService, NebiusBatchService
+
+# --- CONFIG ---
+OPENAI_CHUNK_SIZE = 400
+
+def log_submission(provider, model, filename, batch_id):
+    """Saves IDs to a text file so you can find them tomorrow."""
+    with open("submitted_batches_log.txt", "a") as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"[{timestamp}] {provider} | {model} | {filename} | {batch_id}\n")
+
+async def main():
+    print(f"🚀 STARTING FIRE-AND-FORGET SUBMISSION")
+    
+    # 1. FIND THE FILES (Recursively search all 'data' folders)
+    # This finds files in data/, data/batch_results/, etc.
+    search_pattern = str(PROJECT_ROOT / "data" / "**" / "batch_request_file*.jsonl")
+    all_files = glob.glob(search_pattern, recursive=True)
+    
+    # Filter:
+    # 1. Ignore files that are already split parts ("_part")
+    # 2. Only take files created in the last 24 hours (86400 seconds)
+    current_time = time.time()
+    source_files = [
+        f for f in all_files 
+        if "_part" not in f 
+        and (current_time - os.path.getmtime(f)) < 86400
+    ]
+    
+    if not source_files:
+        print(f"❌ No recent batch files found in {PROJECT_ROOT}/data")
+        return
+
+    print(f"📂 Found {len(source_files)} recent batch files.")
+
+    # Initialize Services
+    nebius_svc = NebiusBatchService()
+    openai_svc = OpenAIBatchService()
+
+    for filepath in source_files:
+        filename = os.path.basename(filepath)
+        
+        # --- STRATEGY: NEBIUS (Submit Whole) ---
+        if "nebius" in filename.lower():
+            print(f"\n🔵 NEBIUS: {filename}")
+            try:
+                # Add timestamp to unique ID to avoid "duplicate" errors
+                batch_tag = f"Nebius_{filename[:15]}_{int(time.time())}"
+                batch_id = await asyncio.to_thread(nebius_svc.submit_batch, filepath, batch_tag)
+                print(f"   ✅ Success! ID: {batch_id}")
+                log_submission("NEBIUS", "Unknown", filename, batch_id)
+            except Exception as e:
+                print(f"   ❌ Failed: {e}")
+
+        # --- STRATEGY: OPENAI (Split & Submit) ---
+        elif "openai" in filename.lower():
+            print(f"\n🟢 OPENAI: {filename} (Splitting...)")
+            
+            # Read file
+            with open(filepath, 'r') as f:
+                lines = f.readlines()
+            
+            if not lines: continue
+            num_chunks = ceil(len(lines) / OPENAI_CHUNK_SIZE)
+            
+            for i in range(num_chunks):
+                part_num = i + 1
+                # Create Part File next to the original
+                original_path = Path(filepath)
+                part_name = f"{original_path.stem}_part{part_num}{original_path.suffix}"
+                part_path = original_path.parent / part_name
+                
+                # Write part
+                with open(part_path, 'w') as out_f:
+                    out_f.writelines(lines[i*OPENAI_CHUNK_SIZE : (i+1)*OPENAI_CHUNK_SIZE])
+                
+                # Submit Part Immediately
+                print(f"   🚀 Submitting Part {part_num}/{num_chunks}...", end="\r")
+                try:
+                    batch_tag = f"OA_P{part_num}_{filename[:10]}_{int(time.time())}"
+                    batch_id = await asyncio.to_thread(
+                        openai_svc.submit_batch, str(part_path), batch_tag
+                    )
+                    print(f"   ✅ Part {part_num} Launched: {batch_id}          ")
+                    log_submission("OPENAI", f"Part_{part_num}", part_name, batch_id)
+                except Exception as e:
+                    print(f"   ❌ Part {part_num} Failed: {e}")
+        
+        else:
+            print(f"⚠️ Skipping unknown provider file: {filename}")
+
+    print("\n" + "="*50)
+    print("✨ ALL DONE. Batches are in the cloud.")
+    print("💤 You can safely turn off your laptop now.")
+    print("📝 Check 'submitted_batches_log.txt' tomorrow for IDs.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 --------------------------------------------------
 src/get_results.py
@@ -2863,103 +3163,51 @@ class Orchestrator:
 --------------------------------------------------
 src/process_all_results.py
 --------------------------------------------------
-"""
-Batch processor that finds all .jsonl results in data/batch_results,
-processes them using ResultsHandler, and saves them to data/processed_results.
-"""
 import logging
 import sys
 from pathlib import Path
-import pandas as pd
-
-# Ensure src is in path if running as script
-sys.path.append(str(Path(__file__).parents[1]))
-
 from src.results_handler import ResultsHandler
 from src.config import PROJECT_ROOT
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("process_all")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+logger = logging.getLogger("processor")
 
-
-def process_all_batches():
-    # 1. Define Directories
-    # input_root = PROJECT_ROOT / "data" / "batch_results"
-    # output_root = PROJECT_ROOT / "data" / "processed_results"
-    input_root = PROJECT_ROOT / "data" / "scrambled_results"
-    output_root = PROJECT_ROOT / "data" / "scrambled_processed"
+def process_all():
+    # Paths updated for your specific folder names
+    input_root = PROJECT_ROOT / "data" / "batch_results_normal_FINAL"
+    output_root = PROJECT_ROOT / "data" / "normal_processed_FINAL"
 
     if not input_root.exists():
-        logger.error(f"❌ Input directory not found: {input_root}")
+        logger.error(f"❌ Folder not found: {input_root}")
         return
 
-    # 2. Find all JSONL files recursively
+    # Find all result files
     jsonl_files = list(input_root.rglob("*.jsonl"))
-    
-    if not jsonl_files:
-        logger.warning(f"⚠️ No .jsonl files found in {input_root}")
-        return
+    logger.info(f"🚀 Found {len(jsonl_files)} parts to process.")
 
-    logger.info(f"🚀 Found {len(jsonl_files)} batch result files to process.")
-
-    success_count = 0
-    error_count = 0
-
-    # 3. Iterate and Process
     for i, jsonl_path in enumerate(jsonl_files, 1):
         try:
-            # Calculate relative path structure (e.g., nebius/L_Gemma327B/combined)
+            # Create a unique subfolder for every part to avoid overwriting
             relative_path = jsonl_path.relative_to(input_root).parent
-            filename_stem = jsonl_path.stem  # Filename without .jsonl
-
-            # Create output path: processed_results/{provider}/{model}/{mode}/{batch_filename}/
-            # We add the filename_stem to avoid overwriting if multiple batches exist for one mode
-            target_dir = output_root / relative_path / filename_stem
+            target_dir = output_root / relative_path / jsonl_path.stem
             
-            logger.info(f"[{i}/{len(jsonl_files)}] Processing: {jsonl_path.name}")
-            logger.debug(f"   📍 Target: {target_dir}")
-
-            # Initialize Handler
+            logger.info(f"[{i}/{len(jsonl_files)}] Processing {jsonl_path.name}...")
             rh = ResultsHandler(target_dir)
 
-            # Load
+            # Load and clean
             raw_df = rh.load_batch_results_jsonl(jsonl_path)
-            if raw_df.empty:
-                logger.warning(f"   ⚠️ Empty dataframe for {jsonl_path.name}. Skipping.")
-                error_count += 1
-                continue
+            if raw_df.empty: continue
 
-            # Save Raw
             rh.save_raw_results(raw_df)
-
-            # Clean & Save
             clean_df = rh.clean_results(raw_df)
-            if clean_df.empty:
-                logger.warning(f"   ⚠️ Cleaning resulted in empty data for {jsonl_path.name}.")
-            else:
+            
+            if not clean_df.empty:
                 rh.save_clean_results(clean_df)
-                logger.info(f"   ✅ Saved clean CSV with {len(clean_df)} rows.")
-                success_count += 1
-
         except Exception as e:
-            logger.error(f"   ❌ Failed to process {jsonl_path.name}: {e}")
-            error_count += 1
-
-    # 4. Summary
-    logger.info("=" * 40)
-    logger.info(f"🎉 Processing Complete.")
-    logger.info(f"✅ Successful: {success_count}")
-    logger.info(f"❌ Failed/Empty: {error_count}")
-    logger.info(f"📂 Results stored in: {output_root}")
-
+            logger.error(f"❌ Failed {jsonl_path.name}: {e}")
 
 if __name__ == "__main__":
-    process_all_batches()
+    process_all()
 
 --------------------------------------------------
 src/prompt_template.py
@@ -3047,6 +3295,416 @@ The final output structure MUST look like:
 }}
 """.strip()
 
+
+--------------------------------------------------
+src/recover_batches.py
+--------------------------------------------------
+import sys
+from pathlib import Path
+from datetime import datetime
+from openai import OpenAI
+
+# Ensure we can import from src
+sys.path.append(str(Path.cwd()))
+from src.llm_service.config import ConfigManager
+
+def fetch_all_batches(client):
+    """Fetch ALL batches using pagination"""
+    all_batches = []
+    last_id = None
+    
+    while True:
+        # Fetch page
+        if last_id:
+            page = client.batches.list(limit=100, after=last_id)
+        else:
+            page = client.batches.list(limit=100)
+            
+        if not page.data:
+            break
+            
+        all_batches.extend(page.data)
+        last_id = page.data[-1].id
+        
+        # Safety break if > 1000 batches
+        if len(all_batches) > 1000: 
+            break
+            
+    return all_batches
+
+def recover_provider(provider_name, api_key, base_url=None):
+    print(f"\n🔍 SCANNING {provider_name.upper()} COMPLETE HISTORY...")
+    
+    if not api_key:
+        print(f"❌ No API key found for {provider_name}")
+        return None, []
+
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        batches = fetch_all_batches(client) # <--- UPDATED
+        
+        candidates = []
+        print(f"{'Date':<20} | {'Batch ID':<35} | {'Status':<10} | {'Rows':<8}")
+        print("-" * 80)
+
+        for b in batches:
+            created = datetime.fromtimestamp(b.created_at).strftime('%Y-%m-%d %H:%M')
+            total_rows = b.request_counts.total if b.request_counts else 0
+            
+            # HIGHLIGHT: Look for > 1000 rows
+            is_candidate = (b.status == "completed" and total_rows > 1000)
+            
+            row_str = f"{created:<20} | {b.id:<35} | {b.status:<10} | {total_rows:<8}"
+            
+            if is_candidate:
+                print(f"✅ {row_str} <--- BIG BATCH FOUND")
+                candidates.append(b)
+            elif "2025-12" in created: # Highlight ANY December batch
+                print(f"🗓️ {row_str} <--- DECEMBER BATCH")
+                candidates.append(b)
+            
+        return client, candidates
+
+    except Exception as e:
+        print(f"❌ Error connecting to {provider_name}: {e}")
+        return None, []
+
+def download_file(client, file_id, filename):
+    print(f"   ⬇️ Downloading {file_id} to {filename}...")
+    try:
+        content = client.files.content(file_id).text
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+        print("   ✨ Success!")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}")
+
+def main():
+    config = ConfigManager()
+    
+    # Check OpenAI
+    client_oa, candidates_oa = recover_provider("OpenAI", config.openai_api_key)
+
+    # Check Nebius
+    client_neb, candidates_neb = recover_provider("Nebius", config.nebius_api_key, config.nebius_base_url)
+
+    # Combine candidates
+    all_candidates = []
+    if candidates_oa: all_candidates.extend([(client_oa, b, "OpenAI") for b in candidates_oa])
+    if candidates_neb: all_candidates.extend([(client_neb, b, "Nebius") for b in candidates_neb])
+
+    if not all_candidates:
+        print("\n❌ No large or December batches found.")
+        return
+
+    print("\n" + "="*50)
+    print(f"🎉 Found {len(all_candidates)} candidates.")
+    
+    confirm = input("Download these files? (y/n): ")
+    if confirm.lower() != 'y': return
+
+    output_dir = Path("recovered_data")
+    output_dir.mkdir(exist_ok=True)
+
+    for client, batch, provider in all_candidates:
+        date_str = datetime.fromtimestamp(batch.created_at).strftime('%Y-%m-%d')
+        rows = batch.request_counts.total if batch.request_counts else 0
+        filename = output_dir / f"{provider}_{date_str}_{rows}rows_{batch.id}.jsonl"
+        
+        if batch.output_file_id:
+            download_file(client, batch.output_file_id, filename)
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------
+src/recover_session.py
+--------------------------------------------------
+import re
+import logging
+from pathlib import Path
+import asyncio
+
+# Import your existing services
+# We assume this script is in the project root, so 'src' is importable
+from src.llm_service.service import OpenAIBatchService, NebiusBatchService
+
+# Setup logging to see what's happening
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("downloader")
+
+# Paste your log data here
+LOG_DATA = """
+[2026-01-13 08:52:35] OPENAI | Part_1 | batch_request_file_openai_GPT4oMini_combined_20260112_221637_part1.jsonl | batch_6965f9c316f08190987d30d768821568
+[2026-01-13 08:52:42] OPENAI | Part_2 | batch_request_file_openai_GPT4oMini_combined_20260112_221637_part2.jsonl | batch_6965f9ca4f808190b894bbdfd28aad2f
+[2026-01-13 08:52:49] OPENAI | Part_3 | batch_request_file_openai_GPT4oMini_combined_20260112_221637_part3.jsonl | batch_6965f9d183b08190952f7d73f247efd0
+[2026-01-13 08:52:56] OPENAI | Part_4 | batch_request_file_openai_GPT4oMini_combined_20260112_221637_part4.jsonl | batch_6965f9d80b508190a0a55826a4b8ffd6
+[2026-01-13 08:53:01] OPENAI | Part_5 | batch_request_file_openai_GPT4oMini_combined_20260112_221637_part5.jsonl | batch_6965f9dd21e881908ad17f71e9859eeb
+[2026-01-13 08:53:04] OPENAI | Part_1 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part1.jsonl | batch_6965f9e0c6108190bb0c3d41f6c98919
+[2026-01-13 08:53:08] OPENAI | Part_2 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part2.jsonl | batch_6965f9e4428c8190ab7c5c70b0923b1b
+[2026-01-13 08:53:12] OPENAI | Part_3 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part3.jsonl | batch_6965f9e7dd488190a34424bd6db78add
+[2026-01-13 08:53:15] OPENAI | Part_4 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part4.jsonl | batch_6965f9eae2e08190baeec22e3c5e1fcd
+[2026-01-13 08:53:18] OPENAI | Part_5 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part5.jsonl | batch_6965f9ede0e08190b03a92bfe9aac291
+[2026-01-13 08:53:21] OPENAI | Part_6 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part6.jsonl | batch_6965f9f109e88190af67d3de996ef5b4
+[2026-01-13 08:53:24] OPENAI | Part_7 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part7.jsonl | batch_6965f9f3e8fc8190a894663ffee28cb5
+[2026-01-13 08:53:26] OPENAI | Part_8 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part8.jsonl | batch_6965f9f6d0748190ba98c86b1ad7a303
+[2026-01-13 08:53:29] OPENAI | Part_9 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part9.jsonl | batch_6965f9f9bc38819093cf74db9b3634fd
+[2026-01-13 08:53:32] OPENAI | Part_10 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part10.jsonl | batch_6965f9fcb8648190bad4b456288fd691
+[2026-01-13 08:53:36] OPENAI | Part_11 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part11.jsonl | batch_6965fa00010481909abf9b9f1a240173
+[2026-01-13 08:53:39] OPENAI | Part_12 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part12.jsonl | batch_6965fa037050819090294ed941696f39
+[2026-01-13 08:53:43] OPENAI | Part_13 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part13.jsonl | batch_6965fa06cbc08190a6ba92b0c5206a48
+[2026-01-13 08:53:46] OPENAI | Part_14 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part14.jsonl | batch_6965fa0a08c4819091a52aa973071201
+[2026-01-13 08:53:49] OPENAI | Part_15 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part15.jsonl | batch_6965fa0d9e4081908b23fda58d7a058f
+[2026-01-13 08:53:53] OPENAI | Part_16 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part16.jsonl | batch_6965fa113d048190a16d002c935ba653
+[2026-01-13 08:53:56] OPENAI | Part_17 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part17.jsonl | batch_6965fa1461848190af0090943e6dd814
+[2026-01-13 08:53:59] OPENAI | Part_18 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part18.jsonl | batch_6965fa176b7c81909c45e7a31a9d1be2
+[2026-01-13 08:54:02] OPENAI | Part_19 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part19.jsonl | batch_6965fa1a4c148190bf48a5d248fdea18
+[2026-01-13 08:54:05] OPENAI | Part_20 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part20.jsonl | batch_6965fa1d5a388190b661b2eb497e3ebb
+[2026-01-13 08:54:08] OPENAI | Part_21 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part21.jsonl | batch_6965fa207bcc8190b10a055de9a15ec1
+[2026-01-13 08:54:11] OPENAI | Part_22 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part22.jsonl | batch_6965fa235b4c81908f0f9eb7933819c0
+[2026-01-13 08:54:14] OPENAI | Part_23 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part23.jsonl | batch_6965fa26d1b08190bf63198cbd82aea5
+[2026-01-13 08:54:18] OPENAI | Part_24 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part24.jsonl | batch_6965fa29fb108190b47951136e925bf6
+[2026-01-13 08:54:21] OPENAI | Part_25 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part25.jsonl | batch_6965fa2cdd7c81908e0f26402f5119cb
+[2026-01-13 08:54:24] OPENAI | Part_26 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part26.jsonl | batch_6965fa30a5408190b47062a529d0a915
+[2026-01-13 08:54:27] OPENAI | Part_27 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part27.jsonl | batch_6965fa33d1f88190b16f8bddd245aad2
+[2026-01-13 08:54:30] OPENAI | Part_28 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part28.jsonl | batch_6965fa36923881909356cf7856cf3d13
+[2026-01-13 08:54:33] OPENAI | Part_29 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part29.jsonl | batch_6965fa39bc448190a8acdc630d013de2
+[2026-01-13 08:54:35] OPENAI | Part_30 | batch_request_file_openai_GPT5Mini_single_20260112_221635_part30.jsonl | batch_6965fa3ae7188190adf25314743ebf7a
+[2026-01-13 08:54:41] OPENAI | Part_1 | batch_request_file_openai_GPT5Nano_combined_20260112_221636_part1.jsonl | batch_6965fa412b648190897c16e5cac32f0b
+[2026-01-13 08:54:48] OPENAI | Part_2 | batch_request_file_openai_GPT5Nano_combined_20260112_221636_part2.jsonl | batch_6965fa47d38481908adbb42abbe23625
+[2026-01-13 08:54:54] OPENAI | Part_3 | batch_request_file_openai_GPT5Nano_combined_20260112_221636_part3.jsonl | batch_6965fa4df0308190ab5842f1dafa0a02
+[2026-01-13 08:55:00] OPENAI | Part_4 | batch_request_file_openai_GPT5Nano_combined_20260112_221636_part4.jsonl | batch_6965fa5405008190a93bc6c536a5118d
+[2026-01-13 08:55:05] OPENAI | Part_5 | batch_request_file_openai_GPT5Nano_combined_20260112_221636_part5.jsonl | batch_6965fa59778c8190b0d90471a099c23e
+[2026-01-13 08:59:19] NEBIUS | Unknown | batch_request_file_nebius_L_Qwen25VL72B_combined_20260112_221635.jsonl | batch_019bb65d-cf12-7ed2-a0fc-7a44aef26fc2
+[2026-01-13 08:59:26] OPENAI | Part_1 | batch_request_file_openai_GPT5Mini_combined_20260112_221636_part1.jsonl | batch_6965fb5e38fc8190a6ddb11d102ee136
+[2026-01-13 08:59:32] OPENAI | Part_2 | batch_request_file_openai_GPT5Mini_combined_20260112_221636_part2.jsonl | batch_6965fb643378819089378e314e50e27d
+[2026-01-13 08:59:38] OPENAI | Part_3 | batch_request_file_openai_GPT5Mini_combined_20260112_221636_part3.jsonl | batch_6965fb6a30a48190bec731be7b8f1bac
+[2026-01-13 08:59:44] OPENAI | Part_4 | batch_request_file_openai_GPT5Mini_combined_20260112_221636_part4.jsonl | batch_6965fb7060448190a99fc027fd76b528
+[2026-01-13 08:59:49] OPENAI | Part_5 | batch_request_file_openai_GPT5Mini_combined_20260112_221636_part5.jsonl | batch_6965fb7566ec819099b5d3613dc39aa5
+[2026-01-13 10:09:07] NEBIUS | Unknown | batch_request_file_nebius_L_Gemma327B_combined_20260112_221632.jsonl | batch_019bb69d-b4cd-76d5-b4a3-a36ea999cd82
+[2026-01-13 10:09:12] OPENAI | Part_1 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part1.jsonl | batch_69660bb7d8d4819085b6dfbb3352d242
+[2026-01-13 10:09:15] OPENAI | Part_2 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part2.jsonl | batch_69660bbb337c81908d93aa380aa870c6
+[2026-01-13 10:09:19] OPENAI | Part_3 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part3.jsonl | batch_69660bbf8fc081908831828f50f4f400
+[2026-01-13 10:09:23] OPENAI | Part_4 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part4.jsonl | batch_69660bc337888190aa16a44eb3e07932
+[2026-01-13 10:09:26] OPENAI | Part_5 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part5.jsonl | batch_69660bc6a5d48190ac9fc61d2cbb4dfd
+[2026-01-13 10:09:30] OPENAI | Part_6 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part6.jsonl | batch_69660bc9e5208190be4f2aaad521efac
+[2026-01-13 10:09:33] OPENAI | Part_7 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part7.jsonl | batch_69660bcdb28c8190a38d50d6cd8d2c4b
+[2026-01-13 10:09:37] OPENAI | Part_8 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part8.jsonl | batch_69660bd175a08190b246b56b692aa07f
+[2026-01-13 10:09:40] OPENAI | Part_9 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part9.jsonl | batch_69660bd4420c8190b048f9a8b479462c
+[2026-01-13 10:09:43] OPENAI | Part_10 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part10.jsonl | batch_69660bd7486c8190ab51e74033f2349c
+[2026-01-13 10:09:46] OPENAI | Part_11 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part11.jsonl | batch_69660bda3b9c8190b00e2ee32b27a343
+[2026-01-13 10:09:50] OPENAI | Part_12 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part12.jsonl | batch_69660bde9b7081908213548bea024887
+[2026-01-13 10:09:54] OPENAI | Part_13 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part13.jsonl | batch_69660be1d72c81908b3a030b4dda6123
+[2026-01-13 10:09:58] OPENAI | Part_14 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part14.jsonl | batch_69660be63e7081909892c04d843fab40
+[2026-01-13 10:10:01] OPENAI | Part_15 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part15.jsonl | batch_69660be99ebc81908f9300243d2eaac8
+[2026-01-13 10:10:04] OPENAI | Part_16 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part16.jsonl | batch_69660becd4cc81908d96b5b8dfa87f8f
+[2026-01-13 10:10:07] OPENAI | Part_17 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part17.jsonl | batch_69660bef8d948190b42e5f4a3edb614f
+[2026-01-13 10:10:10] OPENAI | Part_18 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part18.jsonl | batch_69660bf269408190aeb8416dca163feb
+[2026-01-13 10:10:13] OPENAI | Part_19 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part19.jsonl | batch_69660bf53cc88190a72cb0598ec0ba74
+[2026-01-13 10:10:16] OPENAI | Part_20 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part20.jsonl | batch_69660bf873c08190aa56f7314d01ac3c
+[2026-01-13 10:10:20] OPENAI | Part_21 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part21.jsonl | batch_69660bfbd4ac81908b94a379eaa507ac
+[2026-01-13 10:10:24] OPENAI | Part_22 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part22.jsonl | batch_69660c00b57c81908e903c11e2cde6ac
+[2026-01-13 10:10:28] OPENAI | Part_23 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part23.jsonl | batch_69660c044e548190a70b2685976ae027
+[2026-01-13 10:10:31] OPENAI | Part_24 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part24.jsonl | batch_69660c07a3bc81908e33f84b05229b8f
+[2026-01-13 10:10:34] OPENAI | Part_25 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part25.jsonl | batch_69660c0ad2288190abf110abc3653c2b
+[2026-01-13 10:10:38] OPENAI | Part_26 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part26.jsonl | batch_69660c0e1abc81908e8014cad8dbe259
+[2026-01-13 10:10:41] OPENAI | Part_27 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part27.jsonl | batch_69660c110f8c8190b672c253ed8c16a9
+[2026-01-13 10:10:44] OPENAI | Part_28 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part28.jsonl | batch_69660c147e508190a1a25188c53347a7
+[2026-01-13 10:10:47] OPENAI | Part_29 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part29.jsonl | batch_69660c17632881908e5a0026db413319
+[2026-01-13 10:10:48] OPENAI | Part_30 | batch_request_file_openai_GPT4oMini_single_20260112_221636_part30.jsonl | batch_69660c1851d48190bb567570261d221e
+[2026-01-13 11:36:40] OPENAI | Part_1 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part1.jsonl | batch_696620380afc81908aeb1d74ce46c0cb
+[2026-01-13 11:36:45] OPENAI | Part_2 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part2.jsonl | batch_6966203dce288190920ec2671b9a3ab6
+[2026-01-13 11:36:49] OPENAI | Part_3 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part3.jsonl | batch_69662040c35c8190914c14b2b8852f5e
+[2026-01-13 11:36:52] OPENAI | Part_4 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part4.jsonl | batch_69662043e6a481908b79d1fc7b1a0830
+[2026-01-13 11:36:55] OPENAI | Part_5 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part5.jsonl | batch_696620479f9481908880a67ad9dd177c
+[2026-01-13 11:36:59] OPENAI | Part_6 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part6.jsonl | batch_6966204b538c8190b94464c9ed5e8eb0
+[2026-01-13 11:37:03] OPENAI | Part_7 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part7.jsonl | batch_6966204f172c8190be723f130072cd19
+[2026-01-13 11:37:07] OPENAI | Part_8 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part8.jsonl | batch_6966205364b8819092daf67fac257c2e
+[2026-01-13 11:37:10] OPENAI | Part_9 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part9.jsonl | batch_69662056a23c8190a4555d5a64d8d024
+[2026-01-13 11:37:14] OPENAI | Part_10 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part10.jsonl | batch_69662059e9e08190803e6bb9e2e20883
+[2026-01-13 11:37:17] OPENAI | Part_11 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part11.jsonl | batch_6966205d7f888190a2dee76c5d839cee
+[2026-01-13 11:37:20] OPENAI | Part_12 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part12.jsonl | batch_69662060a5b88190b4e097eb8d6c8684
+[2026-01-13 11:37:23] OPENAI | Part_13 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part13.jsonl | batch_69662063a55481909067660d8cd59b42
+[2026-01-13 11:37:27] OPENAI | Part_14 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part14.jsonl | batch_69662067b8488190a6b9d2b434b60eb0
+[2026-01-13 11:37:31] OPENAI | Part_15 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part15.jsonl | batch_6966206b5e2881908bb131b8bbb3b556
+[2026-01-13 11:37:34] OPENAI | Part_16 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part16.jsonl | batch_6966206ed1f48190a8fa04ec40baa1ba
+[2026-01-13 11:37:37] OPENAI | Part_17 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part17.jsonl | batch_69662071a78c819085305098939dc63b
+[2026-01-13 11:37:41] OPENAI | Part_18 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part18.jsonl | batch_696620755bb88190944af3c35fc429ed
+[2026-01-13 11:37:44] OPENAI | Part_19 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part19.jsonl | batch_696620784bb4819082801ea58bc42616
+[2026-01-13 11:37:47] OPENAI | Part_20 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part20.jsonl | batch_6966207b485881909388af030ba257dc
+[2026-01-13 11:37:51] OPENAI | Part_21 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part21.jsonl | batch_6966207f21c8819096e00e198e1735e4
+[2026-01-13 11:37:54] OPENAI | Part_22 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part22.jsonl | batch_69662081f350819098e0a2e5f9115b18
+[2026-01-13 11:37:57] OPENAI | Part_23 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part23.jsonl | batch_696620854db8819097706772f9993828
+[2026-01-13 11:38:00] OPENAI | Part_24 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part24.jsonl | batch_6966208874c4819086614b5e2e56c623
+[2026-01-13 11:38:03] OPENAI | Part_25 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part25.jsonl | batch_6966208b92148190acb3a3ca24718b7f
+[2026-01-13 11:38:07] OPENAI | Part_26 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part26.jsonl | batch_6966208f2adc8190957f9161beae67cc
+[2026-01-13 11:38:10] OPENAI | Part_27 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part27.jsonl | batch_6966209244cc8190b7a7d50464b71b31
+[2026-01-13 11:38:13] OPENAI | Part_28 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part28.jsonl | batch_6966209579088190b93b6fce5260da05
+[2026-01-13 11:38:16] OPENAI | Part_29 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part29.jsonl | batch_6966209896e881909e167dd756c36015
+[2026-01-13 11:38:17] OPENAI | Part_30 | batch_request_file_openai_GPT5Nano_single_20260112_221636_part30.jsonl | batch_6966209971e88190a7023a949ffeb41e
+[2026-01-13 11:53:06] NEBIUS | Part_1 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part1.jsonl | batch_019bb6fc-e823-71f7-927b-bf032c6ff138
+[2026-01-13 11:54:51] NEBIUS | Part_2 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part2.jsonl | batch_019bb6fe-8110-752a-9dad-095a2d929a98
+[2026-01-13 11:55:47] NEBIUS | Part_3 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part3.jsonl | batch_019bb6ff-5b51-79c6-a975-616fe00f14bd
+[2026-01-13 11:57:24] NEBIUS | Part_4 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part4.jsonl | batch_019bb700-d67d-7e15-804b-e64541312951
+[2026-01-13 11:59:01] NEBIUS | Part_5 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part5.jsonl | batch_019bb702-51f6-77dc-9eb9-167700d9182f
+[2026-01-13 12:00:01] NEBIUS | Part_6 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part6.jsonl | batch_019bb703-3cc9-71cc-a291-2c6d2bf6491e
+[2026-01-13 12:02:03] NEBIUS | Part_7 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part7.jsonl | batch_019bb705-1a8f-734b-bb5c-a6e32356dce1
+[2026-01-13 12:04:10] NEBIUS | Part_8 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part8.jsonl | batch_019bb707-09c3-7aba-95e7-42fe1be4f64c
+[2026-01-13 12:05:35] NEBIUS | Part_9 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part9.jsonl | batch_019bb708-57cf-76e0-819b-1ecf0ac417fa
+[2026-01-13 12:07:41] NEBIUS | Part_10 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part10.jsonl | batch_019bb70a-42dd-7490-9f5a-0867a733a9c9
+[2026-01-13 12:08:51] NEBIUS | Part_11 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part11.jsonl | batch_019bb70b-5492-7a4e-be5a-d57cdd077b1f
+[2026-01-13 12:10:08] NEBIUS | Part_12 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part12.jsonl | batch_019bb70c-81ea-7437-9fef-9808e64b4f76
+[2026-01-13 12:11:26] NEBIUS | Part_13 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part13.jsonl | batch_019bb70d-af32-783d-af38-010af8145ae2
+[2026-01-13 12:13:29] NEBIUS | Part_14 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part14.jsonl | batch_019bb70f-935e-7289-9b09-5b21135db5ab
+[2026-01-13 12:15:35] NEBIUS | Part_15 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part15.jsonl | batch_019bb711-7f5d-735e-a47d-ae02dd6cf615
+[2026-01-13 12:16:39] NEBIUS | Part_16 | batch_request_file_nebius_L_Qwen25VL72B_single_20260112_221632_part16.jsonl | batch_019bb712-75de-7e23-a05b-dcfc1d898c00
+[2026-01-13 12:18:42] NEBIUS | Part_1 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part1.jsonl | batch_019bb714-5878-72ca-b081-9aabce945372
+[2026-01-13 12:20:43] NEBIUS | Part_2 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part2.jsonl | batch_019bb716-30fb-7ce0-8d73-a5d540292518
+[2026-01-13 12:22:16] NEBIUS | Part_3 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part3.jsonl | batch_019bb717-9acb-7ed6-8b02-a495c2a5e8f4
+[2026-01-13 12:23:46] NEBIUS | Part_4 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part4.jsonl | batch_019bb718-fcd5-7065-9905-b4ad59058dac
+[2026-01-13 12:25:22] NEBIUS | Part_5 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part5.jsonl | batch_019bb71a-72bd-7873-bcdf-56962d1d6828
+[2026-01-13 12:26:48] NEBIUS | Part_6 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part6.jsonl | batch_019bb71b-c450-7664-97e6-b5252033ec4d
+[2026-01-13 12:28:49] NEBIUS | Part_7 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part7.jsonl | batch_019bb71d-9c58-7295-bbf4-7e604e23f74a
+[2026-01-13 12:30:01] NEBIUS | Part_8 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part8.jsonl | batch_019bb71e-b62f-763e-8e42-a168d862c6fb
+[2026-01-13 12:31:16] NEBIUS | Part_9 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part9.jsonl | batch_019bb71f-db63-7a2c-8595-9bf8ad6348a7
+[2026-01-13 12:32:27] NEBIUS | Part_10 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part10.jsonl | batch_019bb720-ed39-70b8-bb7d-b01d3d226693
+[2026-01-13 12:33:53] NEBIUS | Part_11 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part11.jsonl | batch_019bb722-40a4-70a0-97ee-3438d8ddcc70
+[2026-01-13 12:35:16] NEBIUS | Part_12 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part12.jsonl | batch_019bb723-8146-7506-aa97-8b4d8d8ac48e
+[2026-01-13 12:37:05] NEBIUS | Part_13 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part13.jsonl | batch_019bb725-2aca-7ee3-ab3c-303220334256
+[2026-01-13 12:38:14] NEBIUS | Part_14 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part14.jsonl | batch_019bb726-38ca-7dba-91b6-19fe17cdab0b
+[2026-01-13 12:40:11] NEBIUS | Part_15 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part15.jsonl | batch_019bb728-040d-7ad5-87e2-963490fcfe93
+[2026-01-13 12:40:36] NEBIUS | Part_16 | batch_request_file_nebius_L_Gemma327B_single_20260112_221629_part16.jsonl | batch_019bb728-6564-701e-8840-cb5492a2a2d7
+"""
+
+def parse_log_line(line):
+    # Split by pipe | to get parts
+    parts = line.split("|")
+    if len(parts) < 4:
+        return None
+    
+    # 0: Timestamp + Provider
+    # 1: Part info
+    # 2: Filename
+    # 3: Batch ID
+    
+    meta_chunk = parts[0].strip()
+    provider = meta_chunk.split(" ")[-1].strip().lower() # e.g. "OPENAI" -> "openai"
+    filename = parts[2].strip()
+    batch_id = parts[3].strip()
+    
+    # Extract metadata from filename for folder structure
+    # Format: batch_request_file_{provider}_{model}_{mode}_{timestamp}_{part}.jsonl
+    # Example: batch_request_file_openai_GPT4oMini_combined_20260112_221637_part1.jsonl
+    
+    # Remove prefix and extension to parse simpler
+    clean_name = filename.replace("batch_request_file_", "").replace(".jsonl", "")
+    tokens = clean_name.split("_")
+    
+    # Heuristic parsing based on known naming convention
+    # tokens[0] = provider
+    # tokens[1] = model (e.g. GPT4oMini or L_Qwen25VL72B which has underscores...)
+    # This is tricky because L_Qwen has underscores. 
+    # Let's rely on finding "single" or "combined" as the anchor.
+    
+    try:
+        if "combined" in tokens:
+            mode_idx = tokens.index("combined")
+        elif "single" in tokens:
+            mode_idx = tokens.index("single")
+        else:
+            mode_idx = -1
+            
+        if mode_idx > 1:
+            # Everything between provider (0) and mode is the model
+            model = "_".join(tokens[1:mode_idx])
+            mode = tokens[mode_idx]
+        else:
+            # Fallback
+            model = "unknown_model"
+            mode = "unknown_mode"
+            
+    except Exception:
+        model = "unknown_model"
+        mode = "unknown_mode"
+
+    return {
+        "provider": provider,
+        "batch_id": batch_id,
+        "model": model,
+        "mode": mode,
+        "filename": filename
+    }
+
+def main():
+    logger.info("🚀 Starting bulk batch download...")
+    
+    # Initialize services
+    try:
+        openai_service = OpenAIBatchService()
+    except Exception as e:
+        logger.warning(f"⚠️ OpenAI Service init failed: {e}")
+        openai_service = None
+
+    try:
+        nebius_service = NebiusBatchService()
+    except Exception as e:
+        logger.warning(f"⚠️ Nebius Service init failed: {e}")
+        nebius_service = None
+        
+    lines = LOG_DATA.strip().split("\n")
+    
+    for line in lines:
+        if not line.strip(): continue
+        
+        data = parse_log_line(line)
+        if not data:
+            continue
+            
+        provider = data["provider"]
+        batch_id = data["batch_id"]
+        
+        # Select service
+        service = None
+        if provider == "openai":
+            service = openai_service
+        elif provider == "nebius":
+            service = nebius_service
+            
+        if not service:
+            logger.error(f"❌ No service available for {provider} (Batch {batch_id})")
+            continue
+
+        # Prepare Output Path
+        # Structure: data/batch_results/{provider}/{model}/{mode}/
+        output_dir = Path("data/batch_results") / provider / data["model"] / data["mode"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Result filename: original_name.results.jsonl or similar
+        # Let's make it clear it's the result
+        result_filename = data["filename"].replace(".jsonl", "_results.jsonl")
+        output_path = output_dir / result_filename
+        
+        if output_path.exists():
+            logger.info(f"⏩ Skipping {batch_id}, file exists: {result_filename}")
+            continue
+            
+        logger.info(f"📥 Downloading {batch_id} -> {output_path}...")
+        
+        # Call the synchronous download wrapper if your service is sync, 
+        # or just call it directly. checking your code, download_batch_results is standard method.
+        try:
+            success = service.download_batch_results(batch_id, str(output_path))
+            if success:
+                logger.info("   ✅ Success")
+            else:
+                logger.error("   ❌ Failed (API returned False)")
+        except Exception as e:
+            logger.error(f"   ❌ Exception: {e}")
+
+    logger.info("✨ Done processing all batches.")
+
+if __name__ == "__main__":
+    main()
 
 --------------------------------------------------
 src/resubmit_and_monitor.py
@@ -3599,6 +4257,83 @@ class ResultsHandler:
         return clean_df
 
 --------------------------------------------------
+src/retry_batches.py
+--------------------------------------------------
+import logging
+from pathlib import Path
+from datetime import datetime
+from src.config import PROJECT_ROOT
+from src.llm_service.service import OpenAIBatchService, NebiusBatchService
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("retry_batches")
+
+# File to log successful submissions
+BATCH_LOG_FILE = PROJECT_ROOT / "data" / "submitted_batches_log.txt"
+
+# Exact filenames extracted from your error logs
+FAILED_FILES = [
+    "batch_request_file_openai_GPT5Mini_single_20260114_145508_part1.jsonl",
+    "batch_request_file_openai_GPT5Nano_single_20260114_145539_part1.jsonl",
+    "batch_request_file_openai_GPT4oMini_single_20260114_145613_part1.jsonl",
+    "batch_request_file_openai_GPT4oMini_combined_20260114_145618_part1.jsonl"
+]
+
+def log_batch_to_file(provider: str, filename: str, batch_id: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] {provider.upper()} | Rescue | {filename} | {batch_id}\n"
+    with open(BATCH_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(log_entry)
+
+def main():
+    # Initialize services
+    openai = OpenAIBatchService()
+    nebius = NebiusBatchService()
+
+    data_dir = PROJECT_ROOT / "data"
+
+    print(f"🚑 Attempting to rescue {len(FAILED_FILES)} failed batches...\n")
+
+    for filename in FAILED_FILES:
+        file_path = data_dir / filename
+        
+        if not file_path.exists():
+            logger.error(f"❌ File not found: {filename}")
+            continue
+
+        # Detect provider
+        if "openai" in filename.lower():
+            service = openai
+            provider = "openai"
+        elif "nebius" in filename.lower():
+            service = nebius
+            provider = "nebius"
+        else:
+            logger.error(f"❓ Unknown provider for {filename}")
+            continue
+
+        logger.info(f"📤 Submitting {filename}...")
+        
+        try:
+            # Submit using 'name' instead of 'description' to match service signature
+            batch_id = service.submit_batch(str(file_path), name="Rescue_Run_Jan14")
+            
+            if batch_id:
+                logger.info(f"   ✅ Success! Batch ID: {batch_id}")
+                log_batch_to_file(provider, filename, batch_id)
+            else:
+                logger.error("   ❌ API returned no Batch ID.")
+                
+        except Exception as e:
+            logger.error(f"   ❌ Exception: {e}")
+
+    print("\n✨ Rescue mission complete.")
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------
 src/run_all_models.py
 --------------------------------------------------
 #!/usr/bin/env python3
@@ -3607,21 +4342,16 @@ import logging
 from pathlib import Path
 import pandas as pd
 from datetime import datetime
-import json
 import argparse
 from typing import Optional, List, Dict, Any
 
-from src.config import settings, PROJECT_ROOT  # ✅ Added PROJECT_ROOT
+from src.config import settings, PROJECT_ROOT
 from src.orchestrator import Orchestrator
 from src.img_traits_def import ImgTraitDefinition
 from src.science_qa import ScienceQA
 from src.llm_service.providers.basic_batch import BaseBatchService
-from src.llm_service.service import (
-    OpenAIBatchService,
-    NebiusBatchService,
-)
 
-# ---------- Setup logging at the MODULE LEVEL ----------
+# ---------- LOGGING SETUP ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
@@ -3629,27 +4359,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("run_all_models")
 
+# ---------- CONSTANTS ----------
+# OpenAI limit is 50k requests per file. We use 45k to be safe.
+MAX_REQUESTS_PER_BATCH = 400 
+# Absolute path to the log file to ensure it's always found
+BATCH_LOG_FILE = PROJECT_ROOT / "data" / "submitted_batches_log.txt"
 
-# ---------- PROVIDER DETECTION (from main.py) ----------
+# ---------- HELPER: Log to File ----------
+def log_batch_to_file(provider: str, part_info: str, filename: str, batch_id: str):
+    """Appends batch submission details to a persistent text file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Format: [Timestamp] PROVIDER | Part_X | filename | batch_id
+    log_entry = f"[{timestamp}] {provider.upper()} | {part_info} | {filename} | {batch_id}\n"
+    
+    try:
+        BATCH_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BATCH_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_entry)
+    except Exception as e:
+        logger.error(f"❌ Failed to write to log file: {e}")
+
+# ---------- PROVIDER DETECTION ----------
 def get_provider_from_model_id(model_id: str) -> str:
-    """Determines the provider based on the model ID prefix"""
     if model_id.upper().startswith("GPT"):
         return "openai"
     elif model_id.upper().startswith("L_"):
         return "nebius"
     raise ValueError(f"Could not determine provider for model {model_id}")
 
-
-# ---------- BATCH HELPERS (from main.py) ----------
+# ---------- BATCH PREPARATION ----------
 async def test_models_batch(
     model_ids: List[str],
     data: pd.DataFrame,
     orchestrator: Orchestrator,
-    mode: str,  # "single", "combined", or "both"
+    mode: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Collect all batch requests across models and questions based on the mode.
-    """
     all_requests = []
     total_questions = len(data)
 
@@ -3660,404 +4404,181 @@ async def test_models_batch(
             logger.error(f"❌ {e}. Skipping model {model_id}.")
             continue
 
-        logger.info(
-            f"\n📋 Collecting requests for {model_id} (Provider: {provider}, Mode: {mode})..."
-        )
+        logger.info(f"\n📋 Collecting requests for {model_id} ({provider}, Mode: {mode})...")
 
         for i, (_, row) in enumerate(data.iterrows(), 1):
             question = ScienceQA.from_df_row(row)
-
             try:
                 if mode in ("single", "both"):
-                    # Assumes prepare_batch_requests adds internal keys:
-                    # _provider, _model_id, _strategy="single"
                     single_reqs, _ = await orchestrator.prepare_batch_requests(
                         question, provider, model_id
                     )
                     all_requests.extend(single_reqs)
 
                 if mode in ("combined", "both"):
-                    # Assumes prepare_combined_batch_requests adds internal keys:
-                    # _provider, _model_id, _strategy="combined"
-                    combined_reqs, _ = (
-                        await orchestrator.prepare_combined_batch_requests(
-                            question, provider, model_id
-                        )
+                    combined_reqs, _ = await orchestrator.prepare_combined_batch_requests(
+                        question, provider, model_id
                     )
                     all_requests.extend(combined_reqs)
 
             except Exception as e:
                 qid = row.get("question_id", "Unknown")
-                logger.error(
-                    f"    Failed to prepare request for QID {qid}, Model {model_id}: {e}"
-                )
+                logger.error(f"    Failed QID {qid}: {e}")
 
-            if (i + 1) % 10 == 0 or (i + 1) == total_questions:
-                logger.info(f"    Processed {i + 1}/{total_questions} questions")
+            if i % 10 == 0 or i == total_questions:
+                print(f"    Processed {i}/{total_questions}", end="\r")
 
+    print("") # Newline after progress
     return all_requests
-
-
-async def monitor_batch_progress(
-    batch_id: str,
-    batch_service: BaseBatchService,
-    check_interval: int,
-    # ✅ Added metadata for download path
-    model_id: str,
-    provider: str,
-    strategy: str,
-):
-    """Monitor batch progress and download results on completion."""
-    _log = logging.getLogger(__name__)
-    _log.info(f"👀 Monitoring batch {batch_id}...")
-
-    while True:
-        try:
-            status = batch_service.get_batch_status(batch_id)
-            batch_status = status.get("status", "unknown")
-
-            if batch_status == "completed":
-                _log.info(f"🎉 Batch {batch_id} completed!")
-
-                # --- ✅ NEW DOWNLOAD LOGIC ---
-                output_file_id = status.get("output_file_id")
-                if not output_file_id:
-                    _log.error(
-                        f"❌ Batch {batch_id} completed but has no output_file_id. Cannot download."
-                    )
-                else:
-                    # Construct the path: data/batch_results/<provider>/<model_id>/<strategy>/
-                    safe_model = "".join(
-                        c if c.isalnum() else "_" for c in model_id
-                    )
-                    output_dir = (
-                        PROJECT_ROOT
-                        / "data"
-                        / "batch_results"
-                        / provider
-                        / safe_model
-                        / strategy
-                    )
-                    output_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Use a unique filename
-                    output_filename = f"results_{batch_id}_{output_file_id}.jsonl"
-                    output_path = output_dir / output_filename
-
-                    _log.info(
-                        f"📥 Downloading results for {batch_id} to {output_path}..."
-                    )
-                    try:
-                        success = batch_service.download_batch_results(
-                            batch_id, str(output_path)
-                        )
-                        if success:
-                            _log.info(f"✅ Download complete: {output_path.name}")
-                        else:
-                            _log.warning(f"⚠️ Download command failed for {batch_id}.")
-                    except Exception as e:
-                        _log.error(f"❌ Download failed for {batch_id}: {e}")
-                # --- END NEW DOWNLOAD LOGIC ---
-
-                error_file_id = status.get("error_file_id")
-                if error_file_id:
-                    _log.warning("⚠️ Batch has errors, checking error file...")
-                    try:
-                        error_content = batch_service.client.files.content(
-                            error_file_id
-                        )
-                        text_preview = getattr(error_content, "text", None)
-                        if text_preview:
-                            _log.error(f"First error: {text_preview[:1000]}...")
-                    except Exception as e:
-                        _log.error(f"Could not retrieve error file: {e}")
-                return True
-
-            elif batch_status == "failed":
-                _log.error(f"❌ Batch {batch_id} failed!")
-                return False
-
-            elif batch_status == "in_progress":
-                counts = status.get("request_counts", {})
-                _log.info(f"⏳ Progress: {counts}")
-
-            await asyncio.sleep(check_interval)
-
-        except Exception as e:
-            _log.error(f"Error checking batch: {e}")
-            await asyncio.sleep(check_interval)
-
 
 # ---------- MAIN RUNNER ----------
 async def run_all_models(args):
-    """
-    Prepare and optionally submit batch JSONL files for ALL models
-    defined in config, respecting the --trait-mode.
-    """
-    logger.info(
-        f"🚀 Starting batch preparation for ALL models (Mode: {args.trait_mode})..."
-    )
+    logger.info(f"🚀 Starting batch run (Mode: {args.trait_mode})")
 
-    # --- Load ALL models from config ---
+    # 1. Load Models
     all_models_dict = settings.get("all_models", {})
     if not all_models_dict:
-        logger.error("❌ No models found in settings['all_models']!")
         raise RuntimeError("No models found in settings['all_models']!")
+    
+    # Filter models if argument provided
+    if args.models:
+        requested_models = args.models.split(",")
+        model_ids_to_test = [m for m in requested_models if m in all_models_dict]
+        if len(model_ids_to_test) < len(requested_models):
+            logger.warning(f"⚠️ Some requested models were not found in config: {set(requested_models) - set(model_ids_to_test)}")
+    else:
+        model_ids_to_test = list(all_models_dict.keys())
+        
+    logger.info(f"🧠 Models: {', '.join(model_ids_to_test)}")
 
-    model_ids_to_test = list(all_models_dict.keys())
-    logger.info(f"🧠 Found {len(model_ids_to_test)} total models to process:")
-    for m_alias in model_ids_to_test:
-        try:
-            provider = get_provider_from_model_id(m_alias)
-            actual_name = all_models_dict[m_alias]
-            logger.info(
-                f"    - {m_alias} (Provider: {provider}, API Name: {actual_name})"
-            )
-        except Exception as e:
-            logger.warning(f"    - Could not determine provider for {m_alias}: {e}")
+    # 2. Load Dataset (Config or CLI Override)
+    # Using PROJECT_ROOT ensures correct path resolution regardless of CWD
+    if args.dataset:
+        csv_path = Path(args.dataset).resolve()
+    else:
+        csv_path = PROJECT_ROOT / settings["paths"]["input_data_csv"]
 
-    # --- Load dataset ---
-    csv_path = Path(settings["paths"]["input_data_csv"])
     if not csv_path.exists():
-        logger.error(f"❌ Input data CSV not found at: {csv_path.resolve()}")
-        raise FileNotFoundError(f"Input data CSV not found at: {csv_path.resolve()}")
-    try:
-        df = pd.read_csv(csv_path)
-        if args.num_questions > 0 and args.num_questions < len(df):
-            df = df.head(args.num_questions)
-            logger.info(
-                f"📚 Loaded {len(df)} questions (limited by --num-questions={args.num_questions}) from: {csv_path.resolve()}"
-            )
-        else:
-            logger.info(
-                f"📚 Loaded all {len(df)} questions from: {csv_path.resolve()}"
-            )
-    except Exception as e:
-        logger.error(f"❌ Failed to load or process CSV '{csv_path}': {e}")
-        return
+        raise FileNotFoundError(f"Input CSV not found: {csv_path}")
+    
+    logger.info(f"📚 Loading dataset: {csv_path.name}")
+    df = pd.read_csv(csv_path)
+    if args.num_questions > 0:
+        df = df.head(args.num_questions)
+        logger.info(f"   Using first {len(df)} rows.")
 
-    # --- Initialize orchestrator and traits ---
-    try:
-        trait_def_path = Path(settings["paths"]["trait_definitions_json"])
-        trait_def = ImgTraitDefinition(trait_def_path)
-        trait_list = list(trait_def.traits.keys())
-        if not trait_list:
-            raise ValueError("Trait definitions loaded but resulted in an empty list.")
-        logger.info(f"🧬 Loaded {len(trait_list)} traits.")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize trait definitions: {e}")
-        return
+    # 3. Init Orchestrator
+    # Using PROJECT_ROOT to safely locate trait definitions
+    trait_def_path = PROJECT_ROOT / settings["paths"]["trait_definitions_json"]
+    trait_def = ImgTraitDefinition(trait_def_path)
+    trait_list = list(trait_def.traits.keys())
+    orchestrator = Orchestrator(trait_names=trait_list)
+    logger.info("✅ Orchestrator ready.")
 
-    # Initialize Orchestrator (following main.py, no checkpoint file)
-    orchestrator = Orchestrator(
-        trait_names=trait_list,
-    )
-    logger.info("✅ Orchestrator initialized.")
-
-    # --- Start request generation ---
-    start_time_all = datetime.now()
-    logger.info(
-        f"🕓 Beginning request generation at {start_time_all.strftime('%Y-%m-%d %H:%M:%S')}..."
-    )
-
-    all_requests = await test_models_batch(
-        model_ids_to_test, df, orchestrator, mode=args.trait_mode
-    )
-
-    elapsed_gen = (datetime.now() - start_time_all).total_seconds()
-    logger.info(
-        f"📦 Total collected {len(all_requests)} requests in {elapsed_gen:.2f}s."
-    )
-
+    # 4. Generate Requests
+    start_time = datetime.now()
+    all_requests = await test_models_batch(model_ids_to_test, df, orchestrator, args.trait_mode)
+    
     if not all_requests:
-        logger.warning("No requests were generated. Exiting.")
+        logger.warning("No requests generated. Exiting.")
         return
 
-    # --- Group requests by (provider, strategy, model) ---
-    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    # 5. Group by (Provider, Strategy, Model)
+    groups = {}
     for r in all_requests:
-        provider = r.get("_provider")
-        strategy = r.get("_strategy")  # e.g., "single" or "combined"
-        model_id = r.get("_model_id")  # e.g., "GPT5Nano"
-
-        if not all([provider, strategy, model_id]):
-            logger.warning(
-                f"Skipping request with missing metadata: {r.get('custom_id')}"
-            )
-            continue
-        key = (provider, strategy, model_id)
+        key = (r.get("_provider"), r.get("_strategy"), r.get("_model_id"))
+        if None in key: continue
         groups.setdefault(key, []).append(r)
 
-    logger.info(f"📊 Found {len(groups)} unique (provider, strategy, model) groups.")
-
-    # --- Write files and optionally submit ---
-
-    # Helper to drop internal metadata keys
-    def _clean(reqs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in reqs]
-
-    base_path = Path(settings["paths"]["batch_request_file"])
+    # 6. Clean, Split, Write, Submit
+    # Using PROJECT_ROOT to ensure base_path is absolute
+    base_path = PROJECT_ROOT / settings["paths"]["batch_request_file"]
     base_path.parent.mkdir(parents=True, exist_ok=True)
-    files_created = []
-
-    # Create a list of tasks to run concurrently (e.g., monitoring)
-    monitor_tasks = []
+    
+    # Helper to clean internal keys
+    def _clean(reqs):
+        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in reqs]
 
     for (provider, strategy, model_id), reqs in groups.items():
         cleaned_reqs = _clean(reqs)
-        safe_model = "".join(c if c.isalnum() else "_" for c in model_id)
-        suffix_provider = "openai" if provider == "openai" else "nebius"
-
-        # Generate a timestamp for this specific file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        output_file = base_path.with_name(
-            f"{base_path.stem}_{suffix_provider}_{safe_model}_{strategy}_{timestamp}{base_path.suffix}"
-        )
-
-        batch_service = None
-        try:
-            if provider == "openai":
-                batch_service = orchestrator.openai_batch_service
-            elif provider == "nebius":
-                batch_service = orchestrator.nebius_batch_service
-            else:
-                logger.error(f"Unknown provider '{provider}' for group. Skipping.")
+        total_reqs = len(cleaned_reqs)
+        
+        # Determine splitting chunks
+        chunks = [cleaned_reqs[i:i + MAX_REQUESTS_PER_BATCH] for i in range(0, total_reqs, MAX_REQUESTS_PER_BATCH)]
+        
+        logger.info(f"📦 Group {model_id} ({strategy}): {total_reqs} requests -> {len(chunks)} split(s)")
+        
+        for i, chunk in enumerate(chunks, 1):
+            # Naming convention: ..._part1.jsonl, ..._part2.jsonl
+            part_suffix = f"_part{i}"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_model = "".join(c if c.isalnum() else "_" for c in model_id)
+            
+            # Construct filename
+            filename = f"{base_path.stem}_{provider}_{safe_model}_{strategy}_{timestamp}{part_suffix}{base_path.suffix}"
+            output_file = base_path.with_name(filename)
+            
+            # Identify service - works for ANY provider defined here
+            service = orchestrator.openai_batch_service if provider == "openai" else orchestrator.nebius_batch_service
+            
+            # Write file
+            try:
+                service.write_jsonl_file(chunk, str(output_file))
+                logger.info(f"   💾 Saved: {output_file.name} ({len(chunk)} reqs)")
+            except Exception as e:
+                logger.error(f"   ❌ Write failed for {output_file.name}: {e}")
                 continue
 
-            batch_service.write_jsonl_file(cleaned_reqs, str(output_file))
-            logger.info(
-                f"💾 Saved {len(cleaned_reqs)} {provider.upper()} {strategy} requests for {model_id} to: {output_file.name}"
-            )
-            files_created.append(output_file)
+            # Submit
+            if args.submit_batch:
+                # Check if this strategy matches trait_mode
+                if args.trait_mode != "both" and args.trait_mode != strategy:
+                    continue
 
-        except Exception as e:
-            logger.error(f"❌ Failed to write file {output_file.name}: {e}")
-            continue
+                logger.info(f"   📤 Submitting {output_file.name}...")
+                try:
+                    batch_id = service.submit_batch(str(output_file), args.batch_name)
+                    if batch_id:
+                        # --- LOGGING TO TEXT FILE ---
+                        part_info = f"Part_{i}" 
+                        log_batch_to_file(provider, part_info, output_file.name, batch_id)
+                        logger.info(f"      ✅ Batch ID: {batch_id} (Logged to file)")
+                    else:
+                        logger.error("      ❌ API returned no Batch ID.")
+                except Exception as e:
+                    logger.error(f"      ❌ Submission failed: {e}")
 
-        # --- Submission Logic (from main.py) ---
-        if not args.submit_batch:
-            continue
+    logger.info(f"✨ Done! Total time: {(datetime.now() - start_time).total_seconds() / 60:.2f} min")
 
-        if not (args.trait_mode == strategy or args.trait_mode == "both"):
-            logger.info(
-                f"    (Skipping submission for {strategy} mode as --trait-mode={args.trait_mode})"
-            )
-            continue
-
-        logger.info(f"📤 Submitting {output_file.name} for {model_id}...")
-        try:
-            batch_id = batch_service.submit_batch(str(output_file), args.batch_name)
-            if batch_id and args.monitor:
-                logger.info(f"    Submitted batch ID: {batch_id}. Monitoring...")
-                # ✅ Schedule monitoring as a concurrent task
-                task = asyncio.create_task(
-                    monitor_batch_progress(
-                        batch_id,
-                        batch_service,
-                        args.check_interval,
-                        model_id=model_id,
-                        provider=provider,
-                        strategy=strategy,
-                    )
-                )
-                monitor_tasks.append(task)
-            elif batch_id:
-                logger.info(f"    Submitted batch ID: {batch_id}. (Not monitoring)")
-            else:
-                logger.error(f"    Batch submission failed for {output_file.name}.")
-
-        except Exception as e:
-            logger.error(f"    ❌ Submission failed for {output_file.name}: {e}")
-
-    # --- Wait for all monitoring tasks to complete ---
-    if monitor_tasks:
-        logger.info(f"Waiting for {len(monitor_tasks)} monitoring task(s) to complete...")
-        await asyncio.gather(*monitor_tasks)
-        logger.info("All monitoring tasks finished.")
-
-    # --- Summary after all models ---
-    end_time_all = datetime.now()
-    total_duration_minutes = (end_time_all - start_time_all).total_seconds() / 60
-    logger.info("=" * 50)
-    logger.info(f"🎉 All models processed in {total_duration_minutes:.2f} minutes.")
-    logger.info(f"📦 Generated {len(files_created)} batch file(s):")
-    if files_created:
-        for f_path in files_created:
-            logger.info(f"   -> {f_path.name}")
-    else:
-        logger.info("   (No files were generated)")
-    logger.info("\n✨ Done!")
-
-
-# ---------- ENTRY POINT ----------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate and submit batch request files for ALL configured models."
-    )
-
-    # --- Args from run_all_models.py ---
-    parser.add_argument(
-        "-n",
-        "--num-questions",
-        type=int,
-        default=1,  # Reduced default for safety
-        help="Number of questions to process (0 for all). Default: 10",
-    )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the logging level (default: INFO).",
-    )
-
-    # --- Args from main.py ---
-    parser.add_argument(
-        "-tm",
-        "--trait-mode",
-        choices=["single", "combined", "both"],
-        default="both",
-        help="How to build batch requests: per-trait, combined, or both. Default: both.",
-    )
-    parser.add_argument(
-        "--batch-name", type=str, help="Optional custom name for batch identification"
-    )
-    parser.add_argument(
-        "--submit-batch",
-        action="store_true",
-        help="Actually submit the generated batch files to the API.",
-    )
-    parser.add_argument(
-        "--monitor",
-        action="store_true",
-        help="Automatically monitor batch after submission (requires --submit-batch).",
-    )
-    parser.add_argument(
-        "--check-interval",
-        type=int,
-        default=300,
-        help="Batch monitoring interval in seconds (default: 300).",
-    )
-
+    parser = argparse.ArgumentParser()
+    
+    # Dataset & Limit
+    parser.add_argument("-n", "--num-questions", type=int, default=0, help="0 for all")
+    parser.add_argument("--dataset", type=str, help="Override input CSV path")
+    
+    # Modes
+    parser.add_argument("-tm", "--trait-mode", choices=["single", "combined", "both"], default="both")
+    parser.add_argument("-m", "--models", type=str, help="Comma-separated list of models to run (e.g. GPT4oMini,L_Gemma327B)")
+    
+    # Batch Actions
+    parser.add_argument("--submit-batch", action="store_true", help="Submit generated files")
+    parser.add_argument("--batch-name", type=str, help="Custom batch description")
+    
+    # Logging
+    parser.add_argument("--log-level", default="INFO")
+    
+    # Ad-hoc commands (kept for compatibility with original main.py args if needed)
+    parser.add_argument("--check-batch", type=str, help="Check status of batch by ID")
+    parser.add_argument("--download-batch", type=str, help="Download results")
+    parser.add_argument("--monitor", action="store_true", help="Monitor (not implemented in this simplified runner)")
+    
     args = parser.parse_args()
-
-    # --- Set logging level based on argument ---
-    log_level_numeric = getattr(logging, args.log_level.upper(), logging.INFO)
-    logger.setLevel(log_level_numeric)
-    logging.getLogger().setLevel(log_level_numeric)  # Set root logger level
-    logger.info(f"Logging level set to {args.log_level.upper()}")
-
-    if args.monitor and not args.submit_batch:
-        logger.warning("--monitor flag ignored as --submit-batch was not specified.")
-
-    try:
-        asyncio.run(run_all_models(args))
-    except (RuntimeError, FileNotFoundError, ValueError, Exception) as e:
-        logger.error(f"💥 An unhandled error occurred: {e}", exc_info=True)
-        import sys
-
-        sys.exit(1)
+    
+    # Set log level
+    logger.setLevel(args.log_level.upper())
+    
+    asyncio.run(run_all_models(args))
 
 --------------------------------------------------
 src/science_qa.py
@@ -4314,6 +4835,103 @@ def build_activity_components(problem: ScienceQA) -> str:
     ).strip()
 
 --------------------------------------------------
+src/sequential_submit.py
+--------------------------------------------------
+#!/usr/bin/env python3
+import logging
+import glob
+import os
+import time
+from pathlib import Path
+from math import ceil
+from datetime import datetime
+from src.config import settings, PROJECT_ROOT
+from src.llm_service.service import OpenAIBatchService
+
+# --- Setup Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("bulk_submit")
+
+# --- Constants ---
+CHUNK_SIZE = 400
+BATCH_LOG_FILE = PROJECT_ROOT / "data" / "submitted_batches_log.txt"
+
+def log_batch_to_file(provider, part_num, filename, batch_id):
+    """Appends to the master log file for retrieval scripts."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] {provider.upper()} | Part_{part_num} | {filename} | {batch_id}\n"
+    try:
+        with open(BATCH_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_entry)
+    except Exception as e:
+        logger.error(f"❌ Failed to write log: {e}")
+
+def main():
+    service = OpenAIBatchService()
+    batch_dir = PROJECT_ROOT / "data"
+    
+    # Target specific models that need splitting
+    targets = [
+        {"model": "GPT5Mini", "strategy": "single"},
+        {"model": "GPT5Nano", "strategy": "single"},
+        {"model": "GPT4oMini", "strategy": "single"},
+        {"model": "GPT4oMini", "strategy": "combined"},
+    ]
+
+    for target in targets:
+        model, strategy = target["model"], target["strategy"]
+        
+        # Find the original large file (looks for files generated today)
+        pattern = str(batch_dir / f"*openai_{model}_{strategy}*.jsonl")
+        matching_files = glob.glob(pattern)
+        
+        # We target the files that were originally generated
+        original_files = [f for f in matching_files if "_part1.jsonl" in f]
+        if not original_files: 
+            logger.warning(f"No original file found for {model} {strategy}")
+            continue
+
+        latest_file = max(original_files, key=os.path.getmtime)
+        logger.info(f"\n📦 Processing Group: {model} ({strategy})")
+
+        with open(latest_file, 'r') as f:
+            lines = f.readlines()
+        
+        num_chunks = ceil(len(lines) / CHUNK_SIZE)
+        logger.info(f"   Splitting {len(lines)} requests into {num_chunks} chunks...")
+        
+        for i in range(num_chunks):
+            part_num = i + 1
+            part_filename = f"bulk_{model}_{strategy}_p{part_num}.jsonl"
+            part_path = batch_dir / part_filename
+            
+            # 1. Create the chunk file
+            with open(part_path, 'w') as out_f:
+                out_f.writelines(lines[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE])
+            
+            # 2. Submit immediately
+            logger.info(f"   📤 Submitting Part {part_num}/{num_chunks}: {part_filename}")
+            try:
+                batch_id = service.submit_batch(str(part_path), name=f"Bulk_{part_filename}")
+                if batch_id:
+                    log_batch_to_file("OPENAI", part_num, part_filename, batch_id)
+                    logger.info(f"      ✅ Success: {batch_id}")
+            except Exception as e:
+                logger.error(f"      ❌ Failed Part {part_num}: {e}")
+
+            # Tiny delay to prevent spamming the local network connection
+            time.sleep(1)
+
+    logger.info("\n✨ All batches submitted to the queue.")
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------------------------
 src/split_and_submit.py
 --------------------------------------------------
 #!/usr/bin/env python3
@@ -4410,6 +5028,7 @@ async def main():
     # 1. Define Targets
     targets = [
         {"model": "GPT5Mini", "strategy": "single"},
+        {"model": "GPT5Mini", "strategy": "combined"},
         {"model": "GPT5Nano", "strategy": "single"},
         {"model": "GPT5Nano", "strategy": "combined"},
         {"model": "GPT4oMini", "strategy": "single"},
@@ -4497,7 +5116,7 @@ import os
 
 # ⚙️ CONFIGURATION
 PATH_SCRAMBLED = "/Users/miriam/projects/multimodal_validators/MMLLMValidatorsTesting/data/scrambled_processed"
-PATH_CLEAN     = "/Users/miriam/projects/multimodal_validators/MMLLMValidatorsTesting/data/processed_results"
+PATH_CLEAN     = "/Users/miriam/projects/multimodal_validators/MMLLMValidatorsTesting/data/normal_processed"
 OUTPUT_CSV     = "evaluation_analysis.csv"
 OUTPUT_PLOT    = "evaluation_plot.png"
 

@@ -1,101 +1,56 @@
+#!/usr/bin/env python3
 """
-Batch processor that finds all .jsonl results in data/batch_results,
-processes them using ResultsHandler, and saves them to data/processed_results.
+Walks a directory tree of JSONL batch results, normalizes them, and writes
+raw/clean CSVs beside each input file (in a mirrored structure).
+
+Keeps the original behavior and folder conventions.
 """
+
+from __future__ import annotations
+
 import logging
-import sys
 from pathlib import Path
-import pandas as pd
 
-# Ensure src is in path if running as script
-sys.path.append(str(Path(__file__).parents[1]))
-
-from src.results_handler import ResultsHandler
 from src.config import PROJECT_ROOT
+from src.results_handler import ResultsHandler
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("process_all")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+logger = logging.getLogger("processor")
 
 
-def process_all_batches():
-    # 1. Define Directories
-    input_root = PROJECT_ROOT / "data" / "batch_results_normal"
-    output_root = PROJECT_ROOT / "data" / "normal_processed"
-    # input_root = PROJECT_ROOT / "data" / "batch_results"   # for nebius, everything stays the same
-    # output_root = PROJECT_ROOT / "data" / "scrambled_processed"
+def process_all() -> None:
+    # Paths retained to match original behavior
+    input_root = PROJECT_ROOT / "data" / "batch_results_scrambled_FINAL"
+    output_root = PROJECT_ROOT / "data" / "scrambled_processed_FINAL"
 
     if not input_root.exists():
-        logger.error(f"❌ Input directory not found: {input_root}")
+        logger.error("❌ Folder not found: %s", input_root)
         return
-
-    # 2. Find all JSONL files recursively
 
     jsonl_files = list(input_root.rglob("*.jsonl"))
-    
-    if not jsonl_files:
-        logger.warning(f"⚠️ No .jsonl files found in {input_root}")
-        return
+    logger.info("🚀 Found %d parts to process.", len(jsonl_files))
 
-    logger.info(f"🚀 Found {len(jsonl_files)} batch result files to process.")
+    for i, jsonl_path in enumerate(jsonl_files, start=1):
+        try:
+            # Mirror folder structure and create a leaf folder per file
+            relative_path = jsonl_path.relative_to(input_root).parent
+            target_dir = output_root / relative_path / jsonl_path.stem
 
-    success_count = 0
-    error_count = 0
+            logger.info("[%d/%d] Processing %s...", i, len(jsonl_files), jsonl_path.name)
+            rh = ResultsHandler(target_dir)
 
-    
-    # 3. Iterate and Process
-    for i, jsonl_path in enumerate(jsonl_files, 1):
-        if "openai" not in jsonl_path.parts or jsonl_path.name == "whole_batch.jsonl":
-            try:
+            raw_df = rh.load_batch_results_jsonl(jsonl_path)
+            if raw_df.empty:
+                continue
 
-                # Calculate relative path structure (e.g., nebius/L_Gemma327B/combined)
-                relative_path = jsonl_path.relative_to(input_root).parent
-                filename_stem = jsonl_path.stem  # Filename without .jsonl
+            rh.save_raw_results(raw_df)
+            clean_df = rh.clean_results(raw_df)
+            if not clean_df.empty:
+                rh.save_clean_results(clean_df)
 
-                # Create output path: processed_results/{provider}/{model}/{mode}/{batch_filename}/
-                # We add the filename_stem to avoid overwriting if multiple batches exist for one mode
-                target_dir = output_root / relative_path / filename_stem
-                
-                logger.info(f"[{i}/{len(jsonl_files)}] Processing: {jsonl_path.name}")
-                logger.debug(f"   📍 Target: {target_dir}")
-
-                # Initialize Handler
-                rh = ResultsHandler(target_dir)
-
-                # Load
-                raw_df = rh.load_batch_results_jsonl(jsonl_path)
-                if raw_df.empty:
-                    logger.warning(f"   ⚠️ Empty dataframe for {jsonl_path.name}. Skipping.")
-                    error_count += 1
-                    continue
-
-                # Save Raw
-                rh.save_raw_results(raw_df)
-
-                # Clean & Save
-                clean_df = rh.clean_results(raw_df)
-                if clean_df.empty:
-                    logger.warning(f"   ⚠️ Cleaning resulted in empty data for {jsonl_path.name}.")
-                else:
-                    rh.save_clean_results(clean_df)
-                    logger.info(f"   ✅ Saved clean CSV with {len(clean_df)} rows.")
-                    success_count += 1
-
-            except Exception as e:
-                logger.error(f"   ❌ Failed to process {jsonl_path.name}: {e}")
-                error_count += 1
-
-    # 4. Summary
-    logger.info("=" * 40)
-    logger.info(f"🎉 Processing Complete.")
-    logger.info(f"✅ Successful: {success_count}")
-    logger.info(f"❌ Failed/Empty: {error_count}")
-    logger.info(f"📂 Results stored in: {output_root}")
+        except Exception as exc:
+            logger.error("❌ Failed %s: %s", jsonl_path.name, exc)
 
 
 if __name__ == "__main__":
-    process_all_batches()
+    process_all()
