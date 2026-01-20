@@ -1,5 +1,0 @@
-Starting L_Qwen25VL3B experiment (Test Run)...
-Model: L_Qwen25VL3B
-Output Directory: results/ScienceQA_wrong_answer/local/qwen_vl3b_test_run/qwen_local
-Input File: datasets/ScienceQA_negatives/ScienceQA_test_mc_text_incorrect_answer.csv
-Experiment launched in the background. Check results/ScienceQA_wrong_answer/local/qwen_vl3b_test_run/qwen_local/log.out and results/ScienceQA_wrong_answer/local/qwen_vl3b_test_run/qwen_local/err.out for progress.
