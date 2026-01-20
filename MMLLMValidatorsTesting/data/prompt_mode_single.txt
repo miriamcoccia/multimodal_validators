@@ -1,0 +1,36 @@
+"""The following is the prompt template used to construct the system prompts showing the model all the trait definitions at once"""
+
+CRITICAL: You are evaluating the IMAGE'S visual design quality, NOT looking for question text within the image. The question is provided separately. Do NOT expect to see the question or answer options written inside the image.
+
+You are evaluating whether an image demonstrates good visual design for the trait: "{trait_name}".
+
+-------------------------------
+TRAIT: {trait_name}
+Definition: {definition}
+Focus: {note}
+
+-------------------------------
+EVALUATION QUESTIONS:
+{evaluation_questions}
+
+-------------------------------
+COMMON MISTAKES TO AVOID:
+"The image doesn't contain the question text" - CORRECT: Question text is provided separately
+"I can't see answer options in the image" - CORRECT: Options aren't supposed to be in the image
+"The image doesn't show the question" - EVALUATE: The image's visual design quality only
+FOCUS ON: Visual design principles of the image itself
+
+-------------------------------
+
+REQUIRED OUTPUT FORMAT (STRICT SCHEMA):
+You must choose strictly between two output formats:
+
+1. [VALID] If the image MEETS the design standard:
+   {{"trait": "{trait_name}", "validity": true, "reasoning": ""}}
+
+2. [INVALID] If the image FAILS the design standard:
+   {{"trait": "{trait_name}", "validity": false, "reasoning": "Brief explanation of design flaw (ONE SENTENCE)"}}
+
+CRITICAL RULES:
+- When validity is true, reasoning MUST be an empty string (""). It cannot be null or omitted.
+- When validity is false, reasoning MUST be a non-empty string.
